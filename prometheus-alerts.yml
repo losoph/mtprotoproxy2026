@@ -1,0 +1,85 @@
+groups:
+  - name: mtprotoproxy-availability
+    rules:
+      - alert: MTProxyHighOverloadDrops
+        expr: increase(mtprotoproxy_connects_dropped_overload[5m]) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy dropping connections due to overload"
+          description: "At least 20 connections dropped in 5m for 10m window."
+
+      - alert: MTProxyCriticalOverloadDrops
+        expr: increase(mtprotoproxy_connects_dropped_overload[5m]) >= 100
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MTProxy critical overload condition"
+          description: "At least 100 dropped connections in 5m for 5m window."
+
+      - alert: MTProxyHandshakeTimeoutsElevated
+        expr: increase(mtprotoproxy_handshake_timeouts[10m]) >= 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy handshake timeouts increased"
+          description: "Handshake timeouts exceed expected baseline."
+
+  - name: mtprotoproxy-upstream
+    rules:
+      - alert: MTProxyUpstreamRetriesHigh
+        expr: increase(mtprotoproxy_upstream_connect_retries[10m]) >= 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy upstream retries are high"
+          description: "Frequent retries suggest upstream path instability."
+
+      - alert: MTProxyCircuitBreakersOpening
+        expr: increase(mtprotoproxy_upstream_circuit_opened[10m]) >= 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy circuit breakers are opening frequently"
+          description: "Repeated breaker openings indicate persistent upstream failures."
+
+      - alert: MTProxyTooManyOpenCircuits
+        expr: mtprotoproxy_upstream_circuits_open >= 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MTProxy has too many open upstream circuits"
+          description: "Five or more circuits are open continuously for 5m."
+
+      - alert: MTProxyNoHealthyUpstreams
+        expr: mtprotoproxy_upstream_health_healthy < 1
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MTProxy sees no healthy upstreams"
+          description: "Health-check has no healthy upstream candidates."
+
+      - alert: MTProxyLowHealthyUpstreamRatio
+        expr: (mtprotoproxy_upstream_health_healthy / (mtprotoproxy_upstream_health_healthy + mtprotoproxy_upstream_health_unhealthy + 1e-9)) < 0.35
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy healthy upstream ratio is low"
+          description: "Healthy upstream ratio below 35% for 10m."
+
+      - alert: MTProxyFailoversElevated
+        expr: increase(mtprotoproxy_upstream_failovers[10m]) >= 40
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy upstream failovers elevated"
+          description: "Failover frequency increased above normal baseline."
