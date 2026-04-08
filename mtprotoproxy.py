@@ -116,7 +116,6 @@ upstream_health_stats = collections.Counter()
 active_client_sem = None
 tls_probe_stats = {}
 tls_probe_history = {}          # domain -> deque of (timestamp, success, latency_ms)
-PROBE_HISTORY_WINDOW = 6 * 60 * 60   # 6 hours
 
 def init_config():
     global config
@@ -329,6 +328,10 @@ def init_config():
 
     # default prefix for metrics
     conf_dict.setdefault("METRICS_PREFIX", "mtprotoproxy_")
+
+    # rolling window for TLS probe domain rating
+    conf_dict.setdefault("TLS_PROBE_HISTORY_HOURS", 6)
+    conf_dict.setdefault("TLS_PROBE_MIN_SAMPLES", 3)
 
     # allow access to config by attributes
     config = Config(conf_dict)
@@ -2347,7 +2350,7 @@ async def tls_probe_rotator():
     ssl_ctx = ssl.create_default_context()
     while True:
         now = time.time()
-        cutoff = now - PROBE_HISTORY_WINDOW
+        cutoff = now - get_tls_probe_window_seconds()
 
         for domain in config.TLS_PROBE_DOMAINS:  # type: ignore
             start = time.time()
@@ -2384,37 +2387,52 @@ async def tls_probe_rotator():
                 mask_host_cached_ip = None   # сбросить кэш IP маски
             print_err(
                 "TLS_DOMAIN auto-switched: %s -> %s "
-                "(6h avg: better score from probe stats)" % (old_domain, best)
+                "(best probe rating for the last %sh)" % (
+                    old_domain,
+                    best,
+                    config.TLS_PROBE_HISTORY_HOURS,  # type: ignore
+                )
             )
 
         await asyncio.sleep(config.TLS_PROBE_ROTATION_PERIOD) # pyright: ignore[reportAttributeAccessIssue]
 
 
 def pick_best_tls_domain():
-    """Return the domain with the best 6-hour rolling score (success_rate / latency).
-    Score = success_rate / (1 + avg_latency_seconds).
-    Returns None if no domain has data yet."""
+    """Return the domain with the best rolling availability score.
+
+    Domains are ranked by:
+    1. success rate during the recent rolling window
+    2. number of successful probes
+    3. average latency of successful probes
+    4. keeping the current TLS_DOMAIN on ties
+    """
     now = time.time()
-    cutoff = now - PROBE_HISTORY_WINDOW
+    cutoff = now - get_tls_probe_window_seconds()
+    min_samples = max(1, int(config.TLS_PROBE_MIN_SAMPLES))  # type: ignore
     best_domain = None
-    best_score = -1.0
+    best_rank = None
 
     for domain, entries in tls_probe_history.items():
         window = [(s, l) for ts, s, l in entries if ts >= cutoff]
-        if not window:
+        if len(window) < min_samples:
             continue
         total = len(window)
         successes = sum(s for s, _ in window)
         success_rate = successes / total
         good_latencies = [l for s, l in window if s]
-        avg_latency_sec = (sum(good_latencies) / len(good_latencies) / 1000.0
-                           if good_latencies else 9999.0)
-        score = success_rate / (1.0 + avg_latency_sec)
-        if score > best_score:
-            best_score = score
+        avg_latency_ms = (sum(good_latencies) / len(good_latencies)
+                          if good_latencies else float("inf"))
+        prefer_current = 1 if domain == config.TLS_DOMAIN else 0  # type: ignore
+        rank = (success_rate, successes, -avg_latency_ms, prefer_current)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
             best_domain = domain
 
     return best_domain
+
+
+def get_tls_probe_window_seconds():
+    return max(1, int(config.TLS_PROBE_HISTORY_HOURS)) * 60 * 60  # type: ignore
 
 def init_ip_info():
     global my_ip_info
