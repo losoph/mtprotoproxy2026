@@ -1,8 +1,26 @@
-PORT = 8443
+import os
+
+# --- Per-instance / secret settings come from the environment ---
+# Do NOT hardcode the secret here again. Put it in a local .env file
+# (git-ignored, see .env.example). Generate one with: openssl rand -hex 16
+#
+# When running under docker compose the .env file is passed into the
+# container via `env_file:` in docker-compose.yml. When running bare
+# (python3 mtprotoproxy.py) just export the variables first.
+
+_secret = os.environ.get("MTPROTO_SECRET", "").strip().lower()
+if not _secret:
+    raise RuntimeError(
+        "MTPROTO_SECRET is not set. Copy .env.example to .env, generate a "
+        "secret with `openssl rand -hex 16`, and put it there."
+    )
+
+PORT = int(os.environ.get("MTPROTO_PORT", "443"))
 
 # name -> secret (32 hex chars)
 USERS = {
-    "tg":  "79390f433f652e13502ed384447eb242",
+    "tg": _secret,
+    # Add more users as "name": "32-hex-char-secret" if needed.
     # "tg2": "0123456789abcdef0123456789abcdef",
 }
 
@@ -19,9 +37,10 @@ MODES = {
     "tls": True
 }
 
-# The domain for TLS mode, bad clients are proxied there
-# Use random existing domain, proxy checks it on start
-TLS_DOMAIN = "vk.com"
+# The domain for TLS mode, bad clients are proxied there.
+# Use a real existing TLS 1.3 domain; the proxy checks it on start.
+# The tls_probe_rotator may auto-switch this to the best-performing domain.
+TLS_DOMAIN = os.environ.get("MTPROTO_TLS_DOMAIN", "vk.com")
 
 # Default profile: medium VDS (1-2 vCPU / 1GB RAM).
 # Balanced for stable operation under moderate load.

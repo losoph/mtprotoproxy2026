@@ -1,9 +1,10 @@
-version: '2.0'
 services:
   mtprotoproxy:
     build: .
     restart: unless-stopped
     network_mode: "host"
+    env_file:
+      - .env
     volumes:
         - ./config.py:/home/tgproxy/config.py
         - ./mtprotoproxy.py:/home/tgproxy/mtprotoproxy.py
@@ -13,4 +14,4 @@ services:
         options:
             max-file: "10"
             max-size: "10m"
-#    mem_limit: 1024m
+#    mem_limit: 768m

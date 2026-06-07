@@ -1,3 +1,449 @@
+#!/usr/bin/env bash
+# =============================================================================
+# setup.sh — развёртывание mtprotoproxy на VDS (Ubuntu 24.04)
+#
+# Использование:
+#   bash setup.sh [целевая_директория]
+#   По умолчанию: ~/mtproto
+#
+# Что делает:
+#   1. Клонирует alexbers/mtprotoproxy (берём pyaes/ и структуру)
+#   2. Перезаписывает файлы вашей модифицированной версией
+#   3. Добавляет .env.example, .gitignore, DEPLOY.md, prometheus-alerts.yml
+#   4. Делает начальный git-коммит
+# =============================================================================
+set -euo pipefail
+
+REPO_DIR="${1:-$HOME/mtproto}"
+CLONE_URL="https://github.com/alexbers/mtprotoproxy.git"
+BRANCH="stable"
+
+# ── цвета для вывода ──────────────────────────────────────────────────────────
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+info()  { echo -e "${GREEN}==>${NC} $*"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
+die()   { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
+
+# ── зависимости ───────────────────────────────────────────────────────────────
+for cmd in git openssl; do
+    command -v "$cmd" &>/dev/null || die "Нужен $cmd: apt install $cmd"
+done
+
+if [ -d "$REPO_DIR/.git" ]; then
+    warn "Директория $REPO_DIR уже содержит git-репозиторий."
+    read -rp "Продолжить и перезаписать файлы? [y/N] " ans
+    [[ "${ans,,}" == "y" ]] || { info "Отменено."; exit 0; }
+fi
+
+# ── клон базового репозитория (pyaes/ и структура) ────────────────────────────
+info "Клонирую базовый репозиторий ($BRANCH)…"
+if [ ! -d "$REPO_DIR" ]; then
+    git clone --depth=1 -b "$BRANCH" "$CLONE_URL" "$REPO_DIR"
+else
+    info "Директория существует, пропускаю clone."
+fi
+cd "$REPO_DIR"
+
+# ── config.py (секрет из env, порт и домен параметризованы) ──────────────────
+info "Записываю config.py…"
+cat > config.py << 'SETUPEOF_CONFIG'
+import os
+
+# --- Per-instance / secret settings come from the environment ---
+# Do NOT hardcode the secret here. Put it in a local .env file
+# (git-ignored, see .env.example). Generate one with: openssl rand -hex 16
+#
+# When running under docker compose the .env file is passed into the
+# container via `env_file:` in docker-compose.yml. When running bare
+# (python3 mtprotoproxy.py) just export the variables first.
+
+_secret = os.environ.get("MTPROTO_SECRET", "").strip().lower()
+if not _secret:
+    raise RuntimeError(
+        "MTPROTO_SECRET is not set. Copy .env.example to .env, generate a "
+        "secret with `openssl rand -hex 16`, and put it there."
+    )
+
+PORT = int(os.environ.get("MTPROTO_PORT", "443"))
+
+# name -> secret (32 hex chars)
+USERS = {
+    "tg": _secret,
+    # Add more users as "name": "32-hex-char-secret" if needed.
+    # "tg2": "0123456789abcdef0123456789abcdef",
+}
+
+MODES = {
+    # Classic mode, easy to detect
+    "classic": False,
+
+    # Makes the proxy harder to detect
+    # Can be incompatible with very old clients
+    "secure": True,
+
+    # Makes the proxy even more hard to detect
+    # Can be incompatible with old clients
+    "tls": True
+}
+
+# The domain for TLS mode; bad clients are proxied there.
+# Use a real existing TLS 1.3 domain; the proxy checks it on start.
+# The tls_probe_rotator may auto-switch this to the best-performing domain.
+TLS_DOMAIN = os.environ.get("MTPROTO_TLS_DOMAIN", "vk.com")
+
+# Default profile: medium VDS (1-2 vCPU / 1GB RAM).
+# Balanced for stable operation under moderate load.
+
+USE_MIDDLE_PROXY = False
+FAST_MODE = True
+PREFER_IPV6 = False
+
+# Backpressure / overload protection.
+MAX_ACTIVE_CLIENTS = 500
+ACCEPT_QUEUE_TIMEOUT = 1.2
+
+# Buffers tuned for 1GB RAM (higher throughput, still bounded).
+TO_CLT_BUFSIZE = (16384, 120, 131072)
+TO_TG_BUFSIZE  = (16384, 120, 131072)
+
+# Client-side timeouts/keepalive.
+CLIENT_HANDSHAKE_TIMEOUT = 12
+CLIENT_KEEPALIVE  = 10 * 60
+CLIENT_ACK_TIMEOUT = 5 * 60
+
+# Upstream connect resilience.
+TG_CONNECT_TIMEOUT     = 10
+TG_CONNECT_RETRIES     = 2
+TG_RETRY_BACKOFF_BASE  = 0.15
+TG_RETRY_BACKOFF_MAX   = 1.0
+TG_RETRY_JITTER        = 0.2
+
+# Upstream socket tuning.
+TG_KEEPALIVE          = 40
+TG_KEEPALIVE_ATTEMPTS = 5
+TG_ACK_TIMEOUT        = 60
+TG_READ_TIMEOUT       = 75
+TG_POOL_SIZE          = 12
+
+# Circuit breaker / failover.
+CIRCUIT_BREAKER_FAILS        = 5
+CIRCUIT_BREAKER_OPEN_SECS    = 30
+UPSTREAM_FAILOVER_ATTEMPTS   = 3
+
+# Health-check (balanced overhead/coverage).
+UPSTREAM_HEALTHCHECK_PERIOD  = 30
+UPSTREAM_HEALTHCHECK_TIMEOUT = 3
+UPSTREAM_HEALTHCHECK_SAMPLE  = 16
+
+# Operational visibility.
+METRICS_PORT             = 9090
+METRICS_LISTEN_ADDR_IPV4 = "127.0.0.1"
+METRICS_WHITELIST        = ["127.0.0.1", "::1"]
+STATS_PRINT_PERIOD       = 600
+
+# External TLS reachability probes (observability only).
+TLS_PROBE_DOMAINS = [
+    "ya.ru",
+    "yandex.ru",
+    "vk.com",
+    "mail.ru",
+    "gosuslugi.ru",
+    "sberbank.ru",
+    "ozon.ru",
+    "wildberries.ru",
+    "avito.ru",
+    "rambler.ru",
+]
+TLS_PROBE_ROTATION_PERIOD = 3 * 60 * 60
+TLS_PROBE_TIMEOUT         = 4
+TLS_PROBE_HISTORY_HOURS   = 6
+TLS_PROBE_MIN_SAMPLES     = 3
+
+# Tag for advertising, obtainable from @MTProxybot
+# AD_TAG = "3c09c680b76ee91a4c25ad51f742267d"
+SETUPEOF_CONFIG
+
+# ── docker-compose.yml ────────────────────────────────────────────────────────
+info "Записываю docker-compose.yml…"
+cat > docker-compose.yml << 'SETUPEOF_COMPOSE'
+services:
+  mtprotoproxy:
+    build: .
+    restart: unless-stopped
+    network_mode: "host"
+    env_file:
+      - .env
+    volumes:
+        - ./config.py:/home/tgproxy/config.py
+        - ./mtprotoproxy.py:/home/tgproxy/mtprotoproxy.py
+        - /etc/localtime:/etc/localtime:ro
+    logging:
+        driver: "json-file"
+        options:
+            max-file: "10"
+            max-size: "10m"
+#    mem_limit: 768m
+SETUPEOF_COMPOSE
+
+# ── Dockerfile ───────────────────────────────────────────────────────────────
+info "Записываю Dockerfile…"
+cat > Dockerfile << 'SETUPEOF_DOCKERFILE'
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    python3 python3-uvloop python3-cryptography python3-socks \
+    libcap2-bin ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN setcap cap_net_bind_service=+ep /usr/bin/python3.12
+
+RUN useradd tgproxy -u 10000
+
+USER tgproxy
+WORKDIR /home/tgproxy/
+
+COPY --chown=tgproxy mtprotoproxy.py config.py /home/tgproxy/
+
+CMD ["python3", "mtprotoproxy.py"]
+SETUPEOF_DOCKERFILE
+
+# ── .env.example ─────────────────────────────────────────────────────────────
+info "Записываю .env.example…"
+cat > .env.example << 'SETUPEOF_ENV'
+# Copy this file to .env and fill it in.  NEVER commit .env to git.
+#   cp .env.example .env
+#
+# Generate a fresh secret (32 hex chars):
+#   openssl rand -hex 16
+MTPROTO_SECRET=
+
+# Port the proxy listens on. 443 blends in best for fake-TLS traffic.
+MTPROTO_PORT=443
+
+# Camouflage domain for fake-TLS. Must be a real, reachable TLS 1.3 host.
+MTPROTO_TLS_DOMAIN=vk.com
+SETUPEOF_ENV
+
+# ── .gitignore ────────────────────────────────────────────────────────────────
+info "Записываю .gitignore…"
+cat > .gitignore << 'SETUPEOF_GITIGNORE'
+# Secrets / local config — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+SETUPEOF_GITIGNORE
+
+# ── prometheus-alerts.yml ─────────────────────────────────────────────────────
+info "Записываю prometheus-alerts.yml…"
+cat > prometheus-alerts.yml << 'SETUPEOF_ALERTS'
+groups:
+  - name: mtprotoproxy-availability
+    rules:
+      - alert: MTProxyHighOverloadDrops
+        expr: increase(mtprotoproxy_connects_dropped_overload[5m]) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy dropping connections due to overload"
+          description: "At least 20 connections dropped in 5m for 10m window."
+
+      - alert: MTProxyCriticalOverloadDrops
+        expr: increase(mtprotoproxy_connects_dropped_overload[5m]) >= 100
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MTProxy critical overload condition"
+          description: "At least 100 dropped connections in 5m for 5m window."
+
+      - alert: MTProxyHandshakeTimeoutsElevated
+        expr: increase(mtprotoproxy_handshake_timeouts[10m]) >= 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy handshake timeouts increased"
+          description: "Handshake timeouts exceed expected baseline."
+
+  - name: mtprotoproxy-upstream
+    rules:
+      - alert: MTProxyUpstreamRetriesHigh
+        expr: increase(mtprotoproxy_upstream_connect_retries[10m]) >= 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy upstream retries are high"
+          description: "Frequent retries suggest upstream path instability."
+
+      - alert: MTProxyCircuitBreakersOpening
+        expr: increase(mtprotoproxy_upstream_circuit_opened[10m]) >= 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy circuit breakers are opening frequently"
+          description: "Repeated breaker openings indicate persistent upstream failures."
+
+      - alert: MTProxyTooManyOpenCircuits
+        expr: mtprotoproxy_upstream_circuits_open >= 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MTProxy has too many open upstream circuits"
+          description: "Five or more circuits are open continuously for 5m."
+
+      - alert: MTProxyNoHealthyUpstreams
+        expr: mtprotoproxy_upstream_health_healthy < 1
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MTProxy sees no healthy upstreams"
+          description: "Health-check has no healthy upstream candidates."
+
+      - alert: MTProxyLowHealthyUpstreamRatio
+        expr: (mtprotoproxy_upstream_health_healthy / (mtprotoproxy_upstream_health_healthy + mtprotoproxy_upstream_health_unhealthy + 1e-9)) < 0.35
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy healthy upstream ratio is low"
+          description: "Healthy upstream ratio below 35% for 10m."
+
+      - alert: MTProxyFailoversElevated
+        expr: increase(mtprotoproxy_upstream_failovers[10m]) >= 40
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MTProxy upstream failovers elevated"
+          description: "Failover frequency increased above normal baseline."
+SETUPEOF_ALERTS
+
+# ── DEPLOY.md ─────────────────────────────────────────────────────────────────
+info "Записываю DEPLOY.md…"
+cat > DEPLOY.md << 'SETUPEOF_DEPLOY'
+# Deploy — MTProto proxy (Ubuntu 24.04)
+
+Развёртывание прокси на чистом VDS (KVM, 1 vCPU / 1 GB RAM / 10 GB NVMe,
+dual-stack IPv4 + IPv6, локация София). Сервер используется **только** как
+шлюз для Telegram.
+
+> **Безопасность секрета.** В коде секрета нет — `config.py` читает его
+> из переменной `MTPROTO_SECRET` (файл `.env`, гитом игнорируется).
+> Старый секрет, ранее лежавший в репозитории, скомпрометирован —
+> никогда его больше не используйте.
+
+---
+
+## 1. Первичная настройка сервера
+
+```bash
+# под root
+adduser deploy && usermod -aG sudo deploy
+rsync --archive --chown=deploy:deploy ~/.ssh /home/deploy/
+
+apt update && apt -y upgrade
+timedatectl set-ntp true
+
+# swap на 1 ГБ ОЗУ — обязателен
+fallocate -l 2G /swapfile && chmod 600 /swapfile
+mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
+
+Проверка IPv6 (должен быть адрес из тарифа):
+```bash
+ip -6 addr
+```
+
+## 2. Файрвол
+
+```bash
+ufw allow OpenSSH
+ufw allow 443/tcp   # или 8443/tcp если MTPROTO_PORT=8443
+ufw enable
+```
+
+## 3. Docker + compose-плагин
+
+```bash
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) \
+  signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+usermod -aG docker deploy
+```
+
+Переlogиньтесь под `deploy`.
+
+## 4. Репозиторий
+
+```bash
+# Если setup.sh ещё не был запущен:
+bash setup.sh ~/mtproto
+```
+
+## 5. Секрет и конфиг
+
+```bash
+cd ~/mtproto
+cp .env.example .env
+# Вставьте новый секрет:
+echo "MTPROTO_SECRET=$(openssl rand -hex 16)" >> .env
+nano .env   # проверьте MTPROTO_PORT и MTPROTO_TLS_DOMAIN
+```
+
+## 6. Сборка и запуск
+
+```bash
+docker compose up -d --build
+docker compose logs --tail=80
+```
+
+В логах появятся ссылки `tg://proxy?...` — это готовые ссылки на прокси.
+
+## 7. Проверка
+
+```bash
+ss -tlnp | grep -E ':(443|8443)'
+docker compose ps
+```
+
+Откройте `tg://`-ссылку в Telegram — предложит подключить прокси.
+
+## 8. Ежедневная эксплуатация
+
+```bash
+docker compose logs -f
+docker compose restart
+docker compose down && docker compose up -d --build  # после правок кода
+docker image prune -f   # чистка старых образов (10 ГБ диска)
+```
+
+Смена секрета — правка `.env` + `docker compose up -d` (без rebuild).
+SETUPEOF_DEPLOY
+
+# ── mtprotoproxy.py (модифицированная версия) ─────────────────────────────────
+info "Записываю mtprotoproxy.py (модифицированная версия)…"
+cat > mtprotoproxy.py << 'SETUPEOF_MTPROTO'
 #!/usr/bin/env python3
 
 import asyncio
@@ -68,9 +514,9 @@ DC_IDX_POS = 60
 
 MIN_CERT_LEN = 1024
 
-PROTO_TAG_ABRIDGED = b"\xef\xef\xef\xef"
+PROTO_TAG_ABRIDGED    = b"\xef\xef\xef\xef"
 PROTO_TAG_INTERMEDIATE = b"\xee\xee\xee\xee"
-PROTO_TAG_SECURE = b"\xdd\xdd\xdd\xdd"
+PROTO_TAG_SECURE      = b"\xdd\xdd\xdd\xdd"
 
 CBC_PADDING = 16
 PADDING_FILLER = b"\x04\x00\x00\x00"
@@ -115,18 +561,16 @@ upstream_health = {}
 upstream_health_stats = collections.Counter()
 active_client_sem = None
 tls_probe_stats = {}
-tls_probe_history = {}          # domain -> deque of (timestamp, success, latency_ms)
+tls_probe_history = {}
+
 
 def init_config():
     global config
-    # we use conf_dict to protect the original config from exceptions when reloading
     if len(sys.argv) < 2:
         conf_dict = runpy.run_module("config")
     elif len(sys.argv) == 2:
-        # launch with own config
         conf_dict = runpy.run_path(sys.argv[1])
     else:
-        # undocumented way of launching
         conf_dict = {}
         conf_dict["PORT"] = int(sys.argv[1])
         secrets = sys.argv[2].split(",")
@@ -141,32 +585,21 @@ def init_config():
     conf_dict = {k: v for k, v in conf_dict.items() if k.isupper()}
 
     conf_dict.setdefault("PORT", 3256)
-    conf_dict.setdefault("USERS", {"tg":  "00000000000000000000000000000000"})
+    conf_dict.setdefault("USERS", {"tg": "00000000000000000000000000000000"})
     conf_dict["AD_TAG"] = bytes.fromhex(conf_dict.get("AD_TAG", ""))
 
     for user, secret in conf_dict["USERS"].items():
         if not re.fullmatch("[0-9a-fA-F]{32}", secret):
             fixed_secret = re.sub(r"[^0-9a-fA-F]", "", secret).zfill(32)[:32]
-
             print_err("Bad secret for user %s, should be 32 hex chars, got %s. " % (user, secret))
             print_err("Changing it to %s" % fixed_secret)
-
             conf_dict["USERS"][user] = fixed_secret
 
-    # load advanced settings
-
-    # use middle proxy, necessary to show ad
     conf_dict.setdefault("USE_MIDDLE_PROXY", len(conf_dict["AD_TAG"]) == 16)
-
-    # if IPv6 available, use it by default, IPv6 with middle proxies is unstable now
     conf_dict.setdefault("PREFER_IPV6", socket.has_ipv6 and not conf_dict["USE_MIDDLE_PROXY"])
-
-    # disables tg->client traffic reencryption, faster but less secure
     conf_dict.setdefault("FAST_MODE", True)
 
-    # enables some working modes
     modes = conf_dict.get("MODES", {})
-
     if "MODES" not in conf_dict:
         modes.setdefault("classic", True)
         modes.setdefault("secure", True)
@@ -180,7 +613,6 @@ def init_config():
     if "SECURE_ONLY" in conf_dict:
         legacy_warning = True
         modes["classic"] = not bool(conf_dict["SECURE_ONLY"])
-
     if "TLS_ONLY" in conf_dict:
         legacy_warning = True
         if conf_dict["TLS_ONLY"]:
@@ -194,100 +626,51 @@ def init_config():
     if legacy_warning:
         print_err("Legacy options SECURE_ONLY or TLS_ONLY detected")
         print_err("Please use MODES in your config instead:")
-        print_err("MODES = {")
+        print_err('MODES = {')
         print_err('    "classic": %s,' % modes["classic"])
         print_err('    "secure": %s,' % modes["secure"])
         print_err('    "tls": %s' % modes["tls"])
         print_err("}")
 
     conf_dict["MODES"] = modes
-
-    # accept incoming connections only with proxy protocol v1/v2, useful for nginx and haproxy
     conf_dict.setdefault("PROXY_PROTOCOL", False)
-
-    # set the tls domain for the proxy, has an influence only on starting message
     conf_dict.setdefault("TLS_DOMAIN", "www.google.com")
-
-    # enable proxying bad clients to some host
     conf_dict.setdefault("MASK", True)
-
-    # the next host to forward bad clients
     conf_dict.setdefault("MASK_HOST", conf_dict["TLS_DOMAIN"])
-
-    # set the home domain for the proxy, has an influence only on the log message
     conf_dict.setdefault("MY_DOMAIN", False)
-
-    # the next host's port to forward bad clients
     conf_dict.setdefault("MASK_PORT", 443)
-
-    # use upstream SOCKS5 proxy
     conf_dict.setdefault("SOCKS5_HOST", None)
     conf_dict.setdefault("SOCKS5_PORT", None)
     conf_dict.setdefault("SOCKS5_USER", None)
     conf_dict.setdefault("SOCKS5_PASS", None)
 
     if conf_dict["SOCKS5_HOST"] and conf_dict["SOCKS5_PORT"]:
-        # Disable the middle proxy if using socks, they are not compatible
         conf_dict["USE_MIDDLE_PROXY"] = False
 
-    # user tcp connection limits, the mapping from name to the integer limit
-    # one client can create many tcp connections, up to 8
     conf_dict.setdefault("USER_MAX_TCP_CONNS", {})
-
-    # expiration date for users in format of day/month/year
     conf_dict.setdefault("USER_EXPIRATIONS", {})
     for user in conf_dict["USER_EXPIRATIONS"]:
         expiration = datetime.datetime.strptime(conf_dict["USER_EXPIRATIONS"][user], "%d/%m/%Y")
         conf_dict["USER_EXPIRATIONS"][user] = expiration
 
-    # the data quota for user
     conf_dict.setdefault("USER_DATA_QUOTA", {})
-
-    # length of used handshake randoms for active fingerprinting protection, zero to disable
     conf_dict.setdefault("REPLAY_CHECK_LEN", 65536)
-
-    # accept clients with bad clocks. This reduces the protection against replay attacks
     conf_dict.setdefault("IGNORE_TIME_SKEW", False)
-
-    # length of last client ip addresses for logging
     conf_dict.setdefault("CLIENT_IPS_LEN", 131072)
-
-    # delay in seconds between stats printing
     conf_dict.setdefault("STATS_PRINT_PERIOD", 600)
-
-    # delay in seconds between middle proxy info updates
     conf_dict.setdefault("PROXY_INFO_UPDATE_PERIOD", 24*60*60)
-
-    # delay in seconds between time getting, zero means disabled
     conf_dict.setdefault("GET_TIME_PERIOD", 10*60)
-
-    # delay in seconds between getting the length of certificate on the mask host
     conf_dict.setdefault("GET_CERT_LEN_PERIOD", random.randrange(4*60*60, 6*60*60))
-
-    # max socket buffer size to the client direction, the more the faster, but more RAM hungry
-    # can be the tuple (low, users_margin, high) for the adaptive case. If no much users, use high
     conf_dict.setdefault("TO_CLT_BUFSIZE", (16384, 100, 131072))
-
-    # max socket buffer size to the telegram servers direction, also can be the tuple
     conf_dict.setdefault("TO_TG_BUFSIZE", 65536)
-
-    # keepalive period for clients in secs
     conf_dict.setdefault("CLIENT_KEEPALIVE", 10*60)
-
-    # drop client after this timeout if the handshake fail
     conf_dict.setdefault("CLIENT_HANDSHAKE_TIMEOUT", random.randrange(5, 15))
-
-    # if client doesn't confirm data for this number of seconds, it is dropped
     conf_dict.setdefault("CLIENT_ACK_TIMEOUT", 5*60)
-
-    # telegram servers connect timeout in seconds
     conf_dict.setdefault("TG_CONNECT_TIMEOUT", 10)
     conf_dict.setdefault("TG_CONNECT_RETRIES", 2)
     conf_dict.setdefault("TG_RETRY_BACKOFF_BASE", 0.15)
     conf_dict.setdefault("TG_RETRY_BACKOFF_MAX", 1.0)
     conf_dict.setdefault("TG_RETRY_JITTER", 0.2)
-
-    # drop connection if no data from telegram server for this many seconds
     conf_dict.setdefault("TG_READ_TIMEOUT", 60)
     conf_dict.setdefault("TG_KEEPALIVE", 40)
     conf_dict.setdefault("TG_KEEPALIVE_ATTEMPTS", 5)
@@ -301,47 +684,25 @@ def init_config():
     conf_dict.setdefault("UPSTREAM_HEALTHCHECK_SAMPLE", 32)
     conf_dict.setdefault("MAX_ACTIVE_CLIENTS", 0)
     conf_dict.setdefault("ACCEPT_QUEUE_TIMEOUT", 1.0)
-
-    # listen address for IPv4
     conf_dict.setdefault("LISTEN_ADDR_IPV4", "0.0.0.0")
-
-    # listen address for IPv6
     conf_dict.setdefault("LISTEN_ADDR_IPV6", "::")
-
-    # listen unix socket
     conf_dict.setdefault("LISTEN_UNIX_SOCK", "")
-
-    # prometheus exporter listen port, use some random port here
     conf_dict.setdefault("METRICS_PORT", None)
-
-    # prometheus listen addr ipv4
     conf_dict.setdefault("METRICS_LISTEN_ADDR_IPV4", "0.0.0.0")
-
-    # prometheus listen addr ipv6
     conf_dict.setdefault("METRICS_LISTEN_ADDR_IPV6", None)
-
-    # prometheus scrapers whitelist
     conf_dict.setdefault("METRICS_WHITELIST", ["127.0.0.1", "::1"])
-
-    # export proxy link to prometheus
     conf_dict.setdefault("METRICS_EXPORT_LINKS", False)
-
-    # default prefix for metrics
     conf_dict.setdefault("METRICS_PREFIX", "mtprotoproxy_")
-
-    # rolling window for TLS probe domain rating
     conf_dict.setdefault("TLS_PROBE_HISTORY_HOURS", 6)
     conf_dict.setdefault("TLS_PROBE_MIN_SAMPLES", 3)
 
-    # allow access to config by attributes
     config = Config(conf_dict)
 
 
 def apply_upstream_proxy_settings():
-    # apply socks settings in place
     if config.get("SOCKS5_HOST") and config.get("SOCKS5_PORT"):
         try:
-            import socks  # type: ignore
+            import socks
         except ImportError:
             print_err("SOCKS5 proxy requested but socks module not installed")
             return
@@ -349,17 +710,17 @@ def apply_upstream_proxy_settings():
         socks.set_default_proxy(socks.PROXY_TYPE_SOCKS5, config.get("SOCKS5_HOST"), config.get("SOCKS5_PORT"),
                                 username=config.get("SOCKS5_USER"), password=config.get("SOCKS5_PASS"))
         if not hasattr(socket, "origsocket"):
-            socket.origsocket = socket.socket  # type: ignore
-            socket.socket = socks.socksocket  # type: ignore
+            socket.origsocket = socket.socket
+            socket.socket = socks.socksocket
     elif hasattr(socket, "origsocket"):
-        socket.socket = socket.origsocket  # type: ignore
-        del socket.origsocket  # type: ignore
+        socket.socket = socket.origsocket
+        del socket.origsocket
 
 
 def try_use_cryptography_module():
     try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore
-        from cryptography.hazmat.backends import default_backend  # type: ignore
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
     except ImportError:
         return None, None
 
@@ -402,8 +763,8 @@ def try_use_cryptography_module():
 
 def try_use_pycrypto_or_pycryptodome_module():
     try:
-        from Crypto.Cipher import AES  # type: ignore
-        from Crypto.Util import Counter  # type: ignore
+        from Crypto.Cipher import AES
+        from Crypto.Util import Counter
     except ImportError:
         return None, None
 
@@ -463,8 +824,7 @@ def print_err(*params):
 
 def ensure_users_in_user_stats():
     global user_stats
-
-    for user in config.USERS:  # type: ignore
+    for user in config.USERS:
         user_stats[user].update()
 
 
@@ -485,17 +845,14 @@ def update_user_stats(user, **kw_stats):
 
 def update_durations(duration):
     global stats
-
     for bucket in STAT_DURATION_BUCKETS:
         if duration <= bucket:
             break
-
     update_stats(**{"connects_with_duration_le_%s" % str(bucket): 1})
 
 
 def get_curr_connects_count():
     global user_stats
-
     all_connects = 0
     for user, stat in user_stats.items():
         all_connects += stat["curr_connects"]
@@ -503,18 +860,16 @@ def get_curr_connects_count():
 
 
 def get_to_tg_bufsize():
-    if isinstance(config.TO_TG_BUFSIZE, int):  # type: ignore
-        return config.TO_TG_BUFSIZE  # type: ignore
-
-    low, margin, high = config.TO_TG_BUFSIZE  # type: ignore
+    if isinstance(config.TO_TG_BUFSIZE, int):
+        return config.TO_TG_BUFSIZE
+    low, margin, high = config.TO_TG_BUFSIZE
     return high if get_curr_connects_count() < margin else low
 
 
 def get_to_clt_bufsize():
-    if isinstance(config.TO_CLT_BUFSIZE, int):  # type: ignore
-        return config.TO_CLT_BUFSIZE  # type: ignore
-
-    low, margin, high = config.TO_CLT_BUFSIZE  # type: ignore
+    if isinstance(config.TO_CLT_BUFSIZE, int):
+        return config.TO_CLT_BUFSIZE
+    low, margin, high = config.TO_CLT_BUFSIZE
     return high if get_curr_connects_count() < margin else low
 
 
@@ -523,8 +878,7 @@ class MyRandom(random.Random):
         super().__init__()
         key = bytes([random.randrange(256) for i in range(32)])
         iv = random.randrange(256**16)
-
-        self.encryptor = create_aes_ctr(key, iv) # type: ignore
+        self.encryptor = create_aes_ctr(key, iv)
         self.buffer = bytearray()
 
     def getrandbits(self, k):
@@ -533,11 +887,9 @@ class MyRandom(random.Random):
 
     def getrandbytes(self, n):
         CHUNK_SIZE = 512
-
         while n > len(self.buffer):
             data = int.to_bytes(super().getrandbits(CHUNK_SIZE*8), CHUNK_SIZE, "big")
             self.buffer += self.encryptor.encrypt(data)
-
         result = self.buffer[:n]
         self.buffer = self.buffer[n:]
         return bytes(result)
@@ -567,8 +919,8 @@ class TgConnectionPool:
     def _breaker_on_fail(self, key):
         state = self.breakers[key]
         state["fails"] += 1
-        if state["fails"] >= config.CIRCUIT_BREAKER_FAILS:  # type: ignore
-            state["open_until"] = time.time() + config.CIRCUIT_BREAKER_OPEN_SECS  # type: ignore
+        if state["fails"] >= config.CIRCUIT_BREAKER_FAILS:
+            state["open_until"] = time.time() + config.CIRCUIT_BREAKER_OPEN_SECS
             update_stats(upstream_circuit_opened=1)
 
     async def open_tg_connection(self, host, port, init_func=None):
@@ -576,25 +928,22 @@ class TgConnectionPool:
         if self._breaker_is_open(key):
             raise ConnectionAbortedError("upstream circuit breaker is open")
 
-        attempts = max(1, config.TG_CONNECT_RETRIES + 1)  # type: ignore
+        attempts = max(1, config.TG_CONNECT_RETRIES + 1)
         last_error = None
         for attempt in range(attempts):
             try:
                 task = asyncio.open_connection(host, port, limit=get_to_clt_bufsize())
-                reader_tgt, writer_tgt = await asyncio.wait_for(task, timeout=config.TG_CONNECT_TIMEOUT)  # type: ignore
-
+                reader_tgt, writer_tgt = await asyncio.wait_for(task, timeout=config.TG_CONNECT_TIMEOUT)
                 sock = writer_tgt.get_extra_info("socket")
-                set_keepalive(sock, config.TG_KEEPALIVE, attempts=config.TG_KEEPALIVE_ATTEMPTS)  # type: ignore
-                set_ack_timeout(sock, config.TG_ACK_TIMEOUT)  # type: ignore
+                set_keepalive(sock, config.TG_KEEPALIVE, attempts=config.TG_KEEPALIVE_ATTEMPTS)
+                set_ack_timeout(sock, config.TG_ACK_TIMEOUT)
                 set_bufsizes(sock, get_to_clt_bufsize(), get_to_tg_bufsize())
                 set_nodelay(sock)
-
                 if init_func:
                     ret = await asyncio.wait_for(init_func(host, port, reader_tgt, writer_tgt),
-                                                 timeout=config.TG_CONNECT_TIMEOUT)  # type: ignore
+                                                 timeout=config.TG_CONNECT_TIMEOUT)
                 else:
                     ret = (reader_tgt, writer_tgt)
-
                 self._breaker_on_success(key)
                 return ret
             except (OSError, asyncio.TimeoutError, ConnectionRefusedError, ConnectionAbortedError) as e:
@@ -603,9 +952,9 @@ class TgConnectionPool:
                 if attempt + 1 >= attempts:
                     break
                 update_stats(upstream_connect_retries=1)
-                base = config.TG_RETRY_BACKOFF_BASE * (2 ** attempt)  # type: ignore
-                backoff = min(config.TG_RETRY_BACKOFF_MAX, base)  # type: ignore
-                jitter = random.uniform(0, config.TG_RETRY_JITTER)  # type: ignore
+                base = config.TG_RETRY_BACKOFF_BASE * (2 ** attempt)
+                backoff = min(config.TG_RETRY_BACKOFF_MAX, base)
+                jitter = random.uniform(0, config.TG_RETRY_JITTER)
                 await asyncio.sleep(backoff + jitter)
 
         raise last_error if last_error else ConnectionAbortedError("upstream connection failed")
@@ -623,32 +972,27 @@ class TgConnectionPool:
     def register_host_port(self, host, port, init_func):
         if (host, port, init_func) not in self.pools:
             self.pools[(host, port, init_func)] = []
-
-        pool_target = min(config.TG_POOL_SIZE, TgConnectionPool.MAX_CONNS_IN_POOL)  # type: ignore
+        pool_target = min(config.TG_POOL_SIZE, TgConnectionPool.MAX_CONNS_IN_POOL)
         while len(self.pools[(host, port, init_func)]) < pool_target:
             connect_task = asyncio.ensure_future(self.open_tg_connection(host, port, init_func))
             self.pools[(host, port, init_func)].append(connect_task)
 
     async def get_connection(self, host, port, init_func=None):
         self.register_host_port(host, port, init_func)
-
         ret = None
         for task in self.pools[(host, port, init_func)][:]:
             if task.done():
                 if task.exception():
                     self.pools[(host, port, init_func)].remove(task)
                     continue
-
                 reader, writer, *other = task.result()
                 if self.is_conn_dead(reader, writer):
                     self.pools[(host, port, init_func)].remove(task)
                     writer.transport.abort()
                     continue
-
                 if not ret:
                     self.pools[(host, port, init_func)].remove(task)
                     ret = (reader, writer, *other)
-
         self.register_host_port(host, port, init_func)
         if ret:
             return ret
@@ -717,16 +1061,13 @@ class FakeTLSStreamReader(LayeredStreamReaderBase):
             tls_rec_type = await self.upstream.readexactly(1)
             if not tls_rec_type:
                 return b""
-
             if tls_rec_type not in [b"\x14", b"\x17"]:
                 print_err("BUG: bad tls type %s in FakeTLSStreamReader" % tls_rec_type)
                 return b""
-
             version = await self.upstream.readexactly(2)
             if version != b"\x03\x03":
                 print_err("BUG: unknown version %s in FakeTLSStreamReader" % version)
                 return b""
-
             data_len = int.from_bytes(await self.upstream.readexactly(2), "big")
             data = await self.upstream.readexactly(data_len)
             if tls_rec_type == b"\x14":
@@ -776,7 +1117,6 @@ class CryptoWrappedStreamReader(LayeredStreamReaderBase):
             data = await self.upstream.read(n)
             if not data:
                 return b""
-
             needed_till_full_block = -len(data) % self.block_size
             if needed_till_full_block > 0:
                 data += await self.upstream.readexactly(needed_till_full_block)
@@ -786,11 +1126,9 @@ class CryptoWrappedStreamReader(LayeredStreamReaderBase):
         if n > len(self.buf):
             to_read = n - len(self.buf)
             needed_till_full_block = -to_read % self.block_size
-
             to_read_block_aligned = to_read + needed_till_full_block
             data = await self.upstream.readexactly(to_read_block_aligned)
             self.buf += self.decryptor.decrypt(data)
-
         ret = bytes(self.buf[:n])
         self.buf = self.buf[n:]
         return ret
@@ -823,28 +1161,22 @@ class MTProtoFrameStreamReader(LayeredStreamReaderBase):
     async def read(self, buf_size):
         msg_len_bytes = await self.upstream.readexactly(4)
         msg_len = int.from_bytes(msg_len_bytes, "little")
-        # skip paddings
         while msg_len == 4:
             msg_len_bytes = await self.upstream.readexactly(4)
             msg_len = int.from_bytes(msg_len_bytes, "little")
-
         len_is_bad = (msg_len % len(PADDING_FILLER) != 0)
         if not MIN_MSG_LEN <= msg_len <= MAX_MSG_LEN or len_is_bad:
             print_err("msg_len is bad, closing connection", msg_len)
             return b""
-
         msg_seq_bytes = await self.upstream.readexactly(4)
         msg_seq = int.from_bytes(msg_seq_bytes, "little", signed=True)
         if msg_seq != self.seq_no:
             print_err("unexpected seq_no")
             return b""
-
         self.seq_no += 1
-
         data = await self.upstream.readexactly(msg_len - 4 - 4 - 4)
         checksum_bytes = await self.upstream.readexactly(4)
         checksum = int.from_bytes(checksum_bytes, "little")
-
         computed_checksum = binascii.crc32(msg_len_bytes + msg_seq_bytes + data)
         if computed_checksum != checksum:
             return b""
@@ -862,13 +1194,10 @@ class MTProtoFrameStreamWriter(LayeredStreamWriterBase):
         len_bytes = int.to_bytes(len(msg) + 4 + 4 + 4, 4, "little")
         seq_bytes = int.to_bytes(self.seq_no, 4, "little", signed=True)
         self.seq_no += 1
-
         msg_without_checksum = len_bytes + seq_bytes + msg
         checksum = int.to_bytes(binascii.crc32(msg_without_checksum), 4, "little")
-
         full_msg = msg_without_checksum + checksum
         padding = PADDING_FILLER * ((-len(full_msg) % CBC_PADDING) // len(PADDING_FILLER))
-
         return self.upstream.write(full_msg + padding)
 
 
@@ -878,20 +1207,15 @@ class MTProtoCompactFrameStreamReader(LayeredStreamReaderBase):
     async def read(self, buf_size):
         msg_len_bytes = await self.upstream.readexactly(1)
         msg_len = int.from_bytes(msg_len_bytes, "little")
-
         extra = {"QUICKACK_FLAG": False}
         if msg_len >= 0x80:
             extra["QUICKACK_FLAG"] = True
             msg_len -= 0x80
-
         if msg_len == 0x7f:
             msg_len_bytes = await self.upstream.readexactly(3)
             msg_len = int.from_bytes(msg_len_bytes, "little")
-
         msg_len *= 4
-
         data = await self.upstream.readexactly(msg_len)
-
         return data, extra
 
 
@@ -901,16 +1225,12 @@ class MTProtoCompactFrameStreamWriter(LayeredStreamWriterBase):
     def write(self, data, extra={}):
         SMALL_PKT_BORDER = 0x7f
         LARGE_PKT_BORDER = 256 ** 3
-
         if len(data) % 4 != 0:
             print_err("BUG: MTProtoFrameStreamWriter attempted to send msg with len", len(data))
             return 0
-
         if extra.get("SIMPLE_ACK"):
             return self.upstream.write(data[::-1])
-
         len_div_four = len(data) // 4
-
         if len_div_four < SMALL_PKT_BORDER:
             return self.upstream.write(bytes([len_div_four]) + data)
         elif len_div_four < LARGE_PKT_BORDER:
@@ -926,12 +1246,10 @@ class MTProtoIntermediateFrameStreamReader(LayeredStreamReaderBase):
     async def read(self, buf_size):
         msg_len_bytes = await self.upstream.readexactly(4)
         msg_len = int.from_bytes(msg_len_bytes, "little")
-
         extra = {}
         if msg_len > 0x80000000:
             extra["QUICKACK_FLAG"] = True
             msg_len -= 0x80000000
-
         data = await self.upstream.readexactly(msg_len)
         return data, extra
 
@@ -952,18 +1270,14 @@ class MTProtoSecureIntermediateFrameStreamReader(LayeredStreamReaderBase):
     async def read(self, buf_size):
         msg_len_bytes = await self.upstream.readexactly(4)
         msg_len = int.from_bytes(msg_len_bytes, "little")
-
         extra = {}
         if msg_len > 0x80000000:
             extra["QUICKACK_FLAG"] = True
             msg_len -= 0x80000000
-
         data = await self.upstream.readexactly(msg_len)
-
         if msg_len % 4 != 0:
             cut_border = msg_len - (msg_len % 4)
             data = data[:cut_border]
-
         return data, extra
 
 
@@ -973,7 +1287,6 @@ class MTProtoSecureIntermediateFrameStreamWriter(LayeredStreamWriterBase):
     def write(self, data, extra={}):
         MAX_PADDING_LEN = 4
         if extra.get("SIMPLE_ACK"):
-            # TODO: make this unpredictable
             return self.upstream.write(data)
         else:
             padding_len = myrandom.randrange(MAX_PADDING_LEN)
@@ -1008,21 +1321,18 @@ class ProxyReqStreamReader(LayeredStreamReaderBase):
         if ans_type == RPC_CLOSE_EXT:
             self.buf = self.buf[4:]
             return b""
-
         if ans_type == RPC_PROXY_ANS:
             if len(self.buf) < 16:
                 return b""
             data = bytes(self.buf[16:])
             self.buf.clear()
             return data
-
         if ans_type == RPC_SIMPLE_ACK:
             if len(self.buf) < 16:
                 return b""
             confirm = bytes(self.buf[12:16])
             self.buf = self.buf[16:]
             return confirm, {"SIMPLE_ACK": True}
-
         if ans_type == RPC_UNKNOWN:
             self.buf = self.buf[4:]
             return b"", {"SKIP_SEND": True}
@@ -1052,29 +1362,28 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
             self.our_ip_port = socket.inet_pton(socket.AF_INET6, my_ip)
         self.our_ip_port += int.to_bytes(my_port, 4, "little")
         self.out_conn_id = myrandom.getrandbytes(8)
-
         self.proto_tag = proto_tag
 
     def write(self, msg, extra={}):
-        RPC_PROXY_REQ = b"\xee\xf1\xce\x36"
-        EXTRA_SIZE = b"\x18\x00\x00\x00"
-        PROXY_TAG = b"\xae\x26\x1e\xdb"
+        RPC_PROXY_REQ  = b"\xee\xf1\xce\x36"
+        EXTRA_SIZE     = b"\x18\x00\x00\x00"
+        PROXY_TAG      = b"\xae\x26\x1e\xdb"
         FOUR_BYTES_ALIGNER = b"\x00\x00\x00"
 
         FLAG_NOT_ENCRYPTED = 0x2
-        FLAG_HAS_AD_TAG = 0x8
-        FLAG_MAGIC = 0x1000
-        FLAG_EXTMODE2 = 0x20000
-        FLAG_PAD = 0x8000000
-        FLAG_INTERMEDIATE = 0x20000000
-        FLAG_ABRIDGED = 0x40000000
-        FLAG_QUICKACK = 0x80000000
+        FLAG_HAS_AD_TAG    = 0x8
+        FLAG_MAGIC         = 0x1000
+        FLAG_EXTMODE2      = 0x20000
+        FLAG_PAD           = 0x8000000
+        FLAG_INTERMEDIATE  = 0x20000000
+        FLAG_ABRIDGED      = 0x40000000
+        FLAG_QUICKACK      = 0x80000000
 
         if len(msg) % 4 != 0:
             print_err("BUG: attempted to send msg with len %d" % len(msg))
             return 0
 
-        flags = FLAG_MAGIC | FLAG_EXTMODE2
+        flags = FLAG_HAS_AD_TAG | FLAG_MAGIC | FLAG_EXTMODE2
 
         if self.proto_tag == PROTO_TAG_ABRIDGED:
             flags |= FLAG_ABRIDGED
@@ -1085,19 +1394,13 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
 
         if extra.get("QUICKACK_FLAG"):
             flags |= FLAG_QUICKACK
-
         if msg.startswith(b"\x00" * 8):
             flags |= FLAG_NOT_ENCRYPTED
 
-        if len(config.AD_TAG) == 16:  # type: ignore
-            flags |= FLAG_HAS_AD_TAG
-
         full_msg = bytearray()
         full_msg += RPC_PROXY_REQ + int.to_bytes(flags, 4, "little") + self.out_conn_id
-        full_msg += self.remote_ip_port + self.our_ip_port
-        if len(config.AD_TAG) == 16:  # type: ignore
-            full_msg += EXTRA_SIZE + PROXY_TAG
-            full_msg += bytes([len(config.AD_TAG)]) + config.AD_TAG + FOUR_BYTES_ALIGNER  # type: ignore
+        full_msg += self.remote_ip_port + self.our_ip_port + EXTRA_SIZE + PROXY_TAG
+        full_msg += bytes([len(config.AD_TAG)]) + config.AD_TAG + FOUR_BYTES_ALIGNER
         full_msg += msg
 
         return self.upstream.write(full_msg)
@@ -1106,7 +1409,7 @@ class ProxyReqStreamWriter(LayeredStreamWriterBase):
 def try_setsockopt(sock, level, option, value):
     try:
         sock.setsockopt(level, option, value)
-    except OSError as E:
+    except OSError:
         pass
 
 
@@ -1142,7 +1445,6 @@ def set_nodelay(sock):
 
 
 def gen_x25519_public_key():
-    # generates some number which has square root by modulo P
     P = 2**255 - 19
     n = myrandom.randrange(P)
     return int.to_bytes((n*n) % P, length=32, byteorder="little")
@@ -1153,25 +1455,21 @@ async def connect_reader_to_writer(reader, writer):
     try:
         while True:
             data = await reader.read(BUF_SIZE)
-
             if not data:
                 if not writer.transport.is_closing():
                     writer.write_eof()
                     await writer.drain()
                 return
-
             writer.write(data)
             await writer.drain()
-    except (OSError, asyncio.IncompleteReadError) as e:
+    except (OSError, asyncio.IncompleteReadError):
         pass
 
 
 async def handle_bad_client(reader_clt, writer_clt, handshake):
     BUF_SIZE = 8192
     CONNECT_TIMEOUT = 5
-
     global mask_host_cached_ip
-
     update_stats(connects_bad=1)
 
     if writer_clt.transport.is_closing():
@@ -1179,16 +1477,15 @@ async def handle_bad_client(reader_clt, writer_clt, handshake):
 
     set_bufsizes(writer_clt.get_extra_info("socket"), BUF_SIZE, BUF_SIZE)
 
-    if not config.MASK or handshake is None:  # type: ignore
+    if not config.MASK or handshake is None:
         while await reader_clt.read(BUF_SIZE):
-            # just consume all the data
             pass
         return
 
     writer_srv = None
     try:
-        host = mask_host_cached_ip or config.MASK_HOST  # type: ignore
-        task = asyncio.open_connection(host, config.MASK_PORT, limit=BUF_SIZE)  # type: ignore
+        host = mask_host_cached_ip or config.MASK_HOST
+        task = asyncio.open_connection(host, config.MASK_PORT, limit=BUF_SIZE)
         reader_srv, writer_srv = await asyncio.wait_for(task, timeout=CONNECT_TIMEOUT)
         if not mask_host_cached_ip:
             mask_host_cached_ip = writer_srv.get_extra_info("peername")[0]
@@ -1201,29 +1498,26 @@ async def handle_bad_client(reader_clt, writer_clt, handshake):
         task_clt_to_srv = asyncio.ensure_future(clt_to_srv)
 
         await asyncio.wait([task_srv_to_clt, task_clt_to_srv], return_when=asyncio.FIRST_COMPLETED)
-
         task_srv_to_clt.cancel()
         task_clt_to_srv.cancel()
 
         if writer_clt.transport.is_closing():
             return
 
-        # if the server closed the connection with RST or FIN-RST, copy them to the client
         if not writer_srv.transport.is_closing():
-            # workaround for uvloop, it doesn't fire exceptions on write_eof
             sock = writer_srv.get_extra_info('socket')
             raw_sock = socket.socket(sock.family, sock.type, sock.proto, sock.fileno())
             try:
                 raw_sock.shutdown(socket.SHUT_WR)
-            except OSError as E:
+            except OSError:
                 set_instant_rst(writer_clt.get_extra_info("socket"))
             finally:
                 raw_sock.detach()
         else:
             set_instant_rst(writer_clt.get_extra_info("socket"))
-    except ConnectionRefusedError as E:
+    except ConnectionRefusedError:
         return
-    except (OSError, asyncio.TimeoutError) as E:
+    except (OSError, asyncio.TimeoutError):
         return
     finally:
         if writer_srv is not None:
@@ -1231,29 +1525,25 @@ async def handle_bad_client(reader_clt, writer_clt, handshake):
 
 
 async def handle_fake_tls_handshake(handshake, reader, writer, peer):
-    global used_handshakes
-    global client_ips
-    global last_client_ips
-    global last_clients_with_time_skew
-    global last_clients_with_same_handshake
-    global fake_cert_len
+    global used_handshakes, client_ips, last_client_ips
+    global last_clients_with_time_skew, last_clients_with_same_handshake, fake_cert_len
 
     TIME_SKEW_MIN = -20 * 60
     TIME_SKEW_MAX = 10 * 60
 
-    TLS_VERS = b"\x03\x03"
-    TLS_CIPHERSUITE = b"\x13\x01"
+    TLS_VERS         = b"\x03\x03"
+    TLS_CIPHERSUITE  = b"\x13\x01"
     TLS_CHANGE_CIPHER = b"\x14" + TLS_VERS + b"\x00\x01\x01"
     TLS_APP_HTTP2_HDR = b"\x17" + TLS_VERS
 
-    DIGEST_LEN = 32
+    DIGEST_LEN     = 32
     DIGEST_HALFLEN = 16
-    DIGEST_POS = 11
+    DIGEST_POS     = 11
 
     SESSION_ID_LEN_POS = DIGEST_POS + DIGEST_LEN
-    SESSION_ID_POS = SESSION_ID_LEN_POS + 1
+    SESSION_ID_POS     = SESSION_ID_LEN_POS + 1
 
-    tls_extensions = b"\x00\x2e" + b"\x00\x33\x00\x24" + b"\x00\x1d\x00\x20"
+    tls_extensions  = b"\x00\x2e" + b"\x00\x33\x00\x24" + b"\x00\x1d\x00\x20"
     tls_extensions += gen_x25519_public_key() + b"\x00\x2b\x00\x02\x03\x04"
 
     digest = handshake[DIGEST_POS:DIGEST_POS+DIGEST_LEN]
@@ -1263,14 +1553,12 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
         return False
 
     sess_id_len = handshake[SESSION_ID_LEN_POS]
-    sess_id = handshake[SESSION_ID_POS:SESSION_ID_POS+sess_id_len]
+    sess_id     = handshake[SESSION_ID_POS:SESSION_ID_POS+sess_id_len]
 
-    for user in config.USERS:  # type: ignore
-        secret = bytes.fromhex(config.USERS[user])  # type: ignore
-
+    for user in config.USERS:
+        secret = bytes.fromhex(config.USERS[user])
         msg = handshake[:DIGEST_POS] + b"\x00"*DIGEST_LEN + handshake[DIGEST_POS+DIGEST_LEN:]
         computed_digest = hmac.new(secret, msg, digestmod=hashlib.sha256).digest()
-
         xored_digest = bytes(digest[i] ^ computed_digest[i] for i in range(DIGEST_LEN))
         digest_good = xored_digest.startswith(b"\x00" * (DIGEST_LEN-4))
 
@@ -1278,11 +1566,9 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
             continue
 
         timestamp = int.from_bytes(xored_digest[-4:], "little")
-        client_time_is_ok = TIME_SKEW_MIN < time.time() - timestamp < TIME_SKEW_MAX
-
-        # some clients fail to read unix time and send the time since boot instead
+        client_time_is_ok    = TIME_SKEW_MIN < time.time() - timestamp < TIME_SKEW_MAX
         client_time_is_small = timestamp < 60*60*24*1000
-        accept_bad_time = config.IGNORE_TIME_SKEW or is_time_skewed or client_time_is_small  # type: ignore
+        accept_bad_time      = config.IGNORE_TIME_SKEW or is_time_skewed or client_time_is_small
 
         if not client_time_is_ok and not accept_bad_time:
             last_clients_with_time_skew[peer[0]] = (time.time() - timestamp) // 60
@@ -1290,10 +1576,10 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
 
         http_data = myrandom.getrandbytes(fake_cert_len)
 
-        srv_hello = TLS_VERS + b"\x00"*DIGEST_LEN + bytes([sess_id_len]) + sess_id
+        srv_hello  = TLS_VERS + b"\x00"*DIGEST_LEN + bytes([sess_id_len]) + sess_id
         srv_hello += TLS_CIPHERSUITE + b"\x00" + tls_extensions
 
-        hello_pkt = b"\x16" + TLS_VERS + int.to_bytes(len(srv_hello) + 4, 2, "big")
+        hello_pkt  = b"\x16" + TLS_VERS + int.to_bytes(len(srv_hello) + 4, 2, "big")
         hello_pkt += b"\x02" + int.to_bytes(len(srv_hello), 3, "big") + srv_hello
         hello_pkt += TLS_CHANGE_CIPHER + TLS_APP_HTTP2_HDR
         hello_pkt += int.to_bytes(len(http_data), 2, "big") + http_data
@@ -1304,13 +1590,13 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
         writer.write(hello_pkt)
         await writer.drain()
 
-        if config.REPLAY_CHECK_LEN > 0:  # type: ignore
-            while len(used_handshakes) >= config.REPLAY_CHECK_LEN:  # type: ignore
+        if config.REPLAY_CHECK_LEN > 0:
+            while len(used_handshakes) >= config.REPLAY_CHECK_LEN:
                 used_handshakes.popitem(last=False)
             used_handshakes[digest[:DIGEST_HALFLEN]] = True
 
-        if config.CLIENT_IPS_LEN > 0:  # type: ignore
-            while len(client_ips) >= config.CLIENT_IPS_LEN:  # type: ignore
+        if config.CLIENT_IPS_LEN > 0:
+            while len(client_ips) >= config.CLIENT_IPS_LEN:
                 client_ips.popitem(last=False)
             if peer[0] not in client_ips:
                 client_ips[peer[0]] = True
@@ -1324,21 +1610,20 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
 
 
 async def handle_proxy_protocol(reader, peer=None):
-    PROXY_SIGNATURE = b"PROXY "
-    PROXY_MIN_LEN = 6
-    PROXY_TCP4 = b"TCP4"
-    PROXY_TCP6 = b"TCP6"
-    PROXY_UNKNOWN = b"UNKNOWN"
+    PROXY_SIGNATURE  = b"PROXY "
+    PROXY_MIN_LEN    = 6
+    PROXY_TCP4       = b"TCP4"
+    PROXY_TCP6       = b"TCP6"
+    PROXY_UNKNOWN    = b"UNKNOWN"
 
     PROXY2_SIGNATURE = b"\x0d\x0a\x0d\x0a\x00\x0d\x0a\x51\x55\x49\x54\x0a"
-    PROXY2_MIN_LEN = 16
+    PROXY2_MIN_LEN   = 16
     PROXY2_AF_UNSPEC = 0x0
-    PROXY2_AF_INET = 0x1
-    PROXY2_AF_INET6 = 0x2
+    PROXY2_AF_INET   = 0x1
+    PROXY2_AF_INET6  = 0x2
 
     header = await reader.readexactly(PROXY_MIN_LEN)
     if header.startswith(PROXY_SIGNATURE):
-        # proxy header v1
         header += await reader.readuntil(b"\r\n")
         _, proxy_fam, *proxy_addr = header[:-2].split(b" ")
         if proxy_fam in (PROXY_TCP4, PROXY_TCP6):
@@ -1352,11 +1637,10 @@ async def handle_proxy_protocol(reader, peer=None):
 
     header += await reader.readexactly(PROXY2_MIN_LEN - PROXY_MIN_LEN)
     if header.startswith(PROXY2_SIGNATURE):
-        # proxy header v2
-        proxy_ver = header[12]
+        proxy_ver  = header[12]
         if proxy_ver & 0xf0 != 0x20:
             return False
-        proxy_len = int.from_bytes(header[14:16], "big")
+        proxy_len  = int.from_bytes(header[14:16], "big")
         proxy_addr = await reader.readexactly(proxy_len)
         if proxy_ver == 0x21:
             proxy_fam = header[13] >> 4
@@ -1379,10 +1663,7 @@ async def handle_proxy_protocol(reader, peer=None):
 
 
 async def handle_handshake(reader, writer):
-    global used_handshakes
-    global client_ips
-    global last_client_ips
-    global last_clients_with_same_handshake
+    global used_handshakes, client_ips, last_client_ips, last_clients_with_same_handshake
 
     TLS_START_BYTES = b"\x16\x03\x01"
 
@@ -1393,8 +1674,8 @@ async def handle_handshake(reader, writer):
     if not peer:
         peer = ("unknown ip", 0)
 
-    if config.PROXY_PROTOCOL:  # type: ignore
-        ip = peer[0] if peer else "unknown ip"
+    if config.PROXY_PROTOCOL:
+        ip   = peer[0] if peer else "unknown ip"
         peer = await handle_proxy_protocol(reader, peer)
         if not peer:
             print_err("Client from %s sent bad proxy protocol headers" % ip)
@@ -1418,21 +1699,20 @@ async def handle_handshake(reader, writer):
     if is_tls_handshake:
         handshake += await reader.readexactly(tls_handshake_len)
         tls_handshake_result = await handle_fake_tls_handshake(handshake, reader, writer, peer)
-
         if not tls_handshake_result:
             await handle_bad_client(reader, writer, handshake)
             return False
         reader, writer = tls_handshake_result
         handshake = await reader.readexactly(HANDSHAKE_LEN)
     else:
-        if not config.MODES["classic"] and not config.MODES["secure"]:  # type: ignore
+        if not config.MODES["classic"] and not config.MODES["secure"]:
             await handle_bad_client(reader, writer, handshake)
             return False
         handshake += await reader.readexactly(HANDSHAKE_LEN - len(handshake))
 
     dec_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN]
     dec_prekey, dec_iv = dec_prekey_and_iv[:PREKEY_LEN], dec_prekey_and_iv[PREKEY_LEN:]
-    enc_prekey_and_iv = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN][::-1]
+    enc_prekey_and_iv  = handshake[SKIP_LEN:SKIP_LEN+PREKEY_LEN+IV_LEN][::-1]
     enc_prekey, enc_iv = enc_prekey_and_iv[:PREKEY_LEN], enc_prekey_and_iv[PREKEY_LEN:]
 
     if dec_prekey_and_iv in used_handshakes:
@@ -1440,39 +1720,39 @@ async def handle_handshake(reader, writer):
         await handle_bad_client(reader, writer, handshake)
         return False
 
-    for user in config.USERS:  # type: ignore
-        secret = bytes.fromhex(config.USERS[user])  # type: ignore
+    for user in config.USERS:
+        secret = bytes.fromhex(config.USERS[user])
 
-        dec_key = hashlib.sha256(dec_prekey + secret).digest()
-        decryptor = create_aes_ctr(key=dec_key, iv=int.from_bytes(dec_iv, "big"))  # type: ignore
+        dec_key   = hashlib.sha256(dec_prekey + secret).digest()
+        decryptor = create_aes_ctr(key=dec_key, iv=int.from_bytes(dec_iv, "big"))
 
-        enc_key = hashlib.sha256(enc_prekey + secret).digest()
-        encryptor = create_aes_ctr(key=enc_key, iv=int.from_bytes(enc_iv, "big"))  # type: ignore
+        enc_key   = hashlib.sha256(enc_prekey + secret).digest()
+        encryptor = create_aes_ctr(key=enc_key, iv=int.from_bytes(enc_iv, "big"))
 
         decrypted = decryptor.decrypt(handshake)
-
         proto_tag = decrypted[PROTO_TAG_POS:PROTO_TAG_POS+4]
+
         if proto_tag not in (PROTO_TAG_ABRIDGED, PROTO_TAG_INTERMEDIATE, PROTO_TAG_SECURE):
             continue
 
         if proto_tag == PROTO_TAG_SECURE:
-            if is_tls_handshake and not config.MODES["tls"]:  # type: ignore
+            if is_tls_handshake and not config.MODES["tls"]:
                 continue
-            if not is_tls_handshake and not config.MODES["secure"]:  # type: ignore
+            if not is_tls_handshake and not config.MODES["secure"]:
                 continue
         else:
-            if not config.MODES["classic"]:  # type: ignore
+            if not config.MODES["classic"]:
                 continue
 
         dc_idx = int.from_bytes(decrypted[DC_IDX_POS:DC_IDX_POS+2], "little", signed=True)
 
-        if config.REPLAY_CHECK_LEN > 0:  # type: ignore
-            while len(used_handshakes) >= config.REPLAY_CHECK_LEN:  # type: ignore
+        if config.REPLAY_CHECK_LEN > 0:
+            while len(used_handshakes) >= config.REPLAY_CHECK_LEN:
                 used_handshakes.popitem(last=False)
             used_handshakes[dec_prekey_and_iv] = True
 
-        if config.CLIENT_IPS_LEN > 0:  # type: ignore
-            while len(client_ips) >= config.CLIENT_IPS_LEN:  # type: ignore
+        if config.CLIENT_IPS_LEN > 0:
+            while len(client_ips) >= config.CLIENT_IPS_LEN:
                 client_ips.popitem(last=False)
             if peer[0] not in client_ips:
                 client_ips[peer[0]] = True
@@ -1488,17 +1768,16 @@ async def handle_handshake(reader, writer):
 
 async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
     RESERVED_NONCE_FIRST_CHARS = [b"\xef"]
-    RESERVED_NONCE_BEGININGS = [b"\x48\x45\x41\x44", b"\x50\x4F\x53\x54",
-                                b"\x47\x45\x54\x20", b"\xee\xee\xee\xee",
-                                b"\xdd\xdd\xdd\xdd", b"\x16\x03\x01\x02"]
-    RESERVED_NONCE_CONTINUES = [b"\x00\x00\x00\x00"]
+    RESERVED_NONCE_BEGININGS   = [b"\x48\x45\x41\x44", b"\x50\x4F\x53\x54",
+                                  b"\x47\x45\x54\x20", b"\xee\xee\xee\xee",
+                                  b"\xdd\xdd\xdd\xdd", b"\x16\x03\x01\x02"]
+    RESERVED_NONCE_CONTINUES   = [b"\x00\x00\x00\x00"]
 
-    global my_ip_info
-    global tg_connection_pool
+    global my_ip_info, tg_connection_pool
 
     dc_idx = abs(dc_idx) - 1
 
-    if my_ip_info["ipv6"] and (config.PREFER_IPV6 or not my_ip_info["ipv4"]):  # type: ignore
+    if my_ip_info["ipv6"] and (config.PREFER_IPV6 or not my_ip_info["ipv4"]):
         if not 0 <= dc_idx < len(TG_DATACENTERS_V6):
             return False
         dc = TG_DATACENTERS_V6[dc_idx]
@@ -1509,13 +1788,13 @@ async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
 
     try:
         reader_tgt, writer_tgt = await tg_connection_pool.get_connection(dc, TG_DATACENTER_PORT)
-    except ConnectionRefusedError as E:
+    except ConnectionRefusedError:
         print_err("Got connection refused while trying to connect to", dc, TG_DATACENTER_PORT)
         return False
-    except ConnectionAbortedError as E:
-        print_err("The Telegram server connection is bad: %d (%s %s) %s" % (dc_idx, dc, TG_DATACENTER_PORT, E))
+    except ConnectionAbortedError as e:
+        print_err("The Telegram server connection is bad: %d (%s %s) %s" % (dc_idx, dc, TG_DATACENTER_PORT, e))
         return False
-    except (OSError, asyncio.TimeoutError) as E:
+    except (OSError, asyncio.TimeoutError):
         print_err("Unable to connect to", dc, TG_DATACENTER_PORT)
         return False
 
@@ -1536,13 +1815,13 @@ async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
 
     rnd = bytes(rnd)
 
-    dec_key_and_iv = rnd[SKIP_LEN:SKIP_LEN+KEY_LEN+IV_LEN][::-1]
+    dec_key_and_iv  = rnd[SKIP_LEN:SKIP_LEN+KEY_LEN+IV_LEN][::-1]
     dec_key, dec_iv = dec_key_and_iv[:KEY_LEN], dec_key_and_iv[KEY_LEN:]
-    decryptor = create_aes_ctr(key=dec_key, iv=int.from_bytes(dec_iv, "big"))  # type: ignore
+    decryptor = create_aes_ctr(key=dec_key, iv=int.from_bytes(dec_iv, "big"))
 
-    enc_key_and_iv = rnd[SKIP_LEN:SKIP_LEN+KEY_LEN+IV_LEN]
+    enc_key_and_iv  = rnd[SKIP_LEN:SKIP_LEN+KEY_LEN+IV_LEN]
     enc_key, enc_iv = enc_key_and_iv[:KEY_LEN], enc_key_and_iv[KEY_LEN:]
-    encryptor = create_aes_ctr(key=enc_key, iv=int.from_bytes(enc_iv, "big"))  # type: ignore
+    encryptor = create_aes_ctr(key=enc_key, iv=int.from_bytes(enc_iv, "big"))
 
     rnd_enc = rnd[:PROTO_TAG_POS] + encryptor.encrypt(rnd)[PROTO_TAG_POS:]
 
@@ -1556,10 +1835,8 @@ async def do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=None):
 
 
 def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_port, purpose,
-                                   clt_ip, srv_port, middleproxy_secret, clt_ipv6=None,
-                                   srv_ipv6=None):
+                                   clt_ip, srv_port, middleproxy_secret, clt_ipv6=None, srv_ipv6=None):
     EMPTY_IP = b"\x00\x00\x00\x00"
-
     if not clt_ip or not srv_ip:
         clt_ip = EMPTY_IP
         srv_ip = EMPTY_IP
@@ -1567,42 +1844,35 @@ def get_middleproxy_aes_key_and_iv(nonce_srv, nonce_clt, clt_ts, srv_ip, clt_por
     s = bytearray()
     s += nonce_srv + nonce_clt + clt_ts + srv_ip + clt_port + purpose + clt_ip + srv_port
     s += middleproxy_secret + nonce_srv
-
     if clt_ipv6 and srv_ipv6:
         s += clt_ipv6 + srv_ipv6
-
     s += nonce_clt
 
-    md5_sum = hashlib.md5(s[1:]).digest()
+    md5_sum  = hashlib.md5(s[1:]).digest()
     sha1_sum = hashlib.sha1(s).digest()
-
     key = md5_sum[:12] + sha1_sum
-    iv = hashlib.md5(s[2:]).digest()
+    iv  = hashlib.md5(s[2:]).digest()
     return key, iv
 
 
 async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
-    """ The most logic of middleproxy handshake, launched in pool """
     START_SEQ_NO = -2
-    NONCE_LEN = 16
+    NONCE_LEN    = 16
 
     RPC_HANDSHAKE = b"\xf5\xee\x82\x76"
-    RPC_NONCE = b"\xaa\x87\xcb\x7a"
-    # pass as consts to simplify code
-    RPC_FLAGS = b"\x00\x00\x00\x00"
-    CRYPTO_AES = b"\x01\x00\x00\x00"
+    RPC_NONCE     = b"\xaa\x87\xcb\x7a"
+    RPC_FLAGS     = b"\x00\x00\x00\x00"
+    CRYPTO_AES    = b"\x01\x00\x00\x00"
 
-    RPC_NONCE_ANS_LEN = 32
+    RPC_NONCE_ANS_LEN     = 32
     RPC_HANDSHAKE_ANS_LEN = 32
 
-    writer_tgt = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO)
+    writer_tgt   = MTProtoFrameStreamWriter(writer_tgt, START_SEQ_NO)
     key_selector = PROXY_SECRET[:4]
-    crypto_ts = int.to_bytes(int(time.time()) % (256**4), 4, "little")
-
-    nonce = myrandom.getrandbytes(NONCE_LEN)
+    crypto_ts    = int.to_bytes(int(time.time()) % (256**4), 4, "little")
+    nonce        = myrandom.getrandbytes(NONCE_LEN)
 
     msg = RPC_NONCE + key_selector + CRYPTO_AES + crypto_ts + nonce
-
     writer_tgt.write(msg)
     await writer_tgt.drain()
 
@@ -1619,7 +1889,6 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
     if rpc_type != RPC_NONCE or rpc_key_selector != key_selector or rpc_schema != CRYPTO_AES:
         raise ConnectionAbortedError("bad rpc answer")
 
-    # get keys
     tg_ip, tg_port = writer_tgt.upstream.get_extra_info('peername')[:2]
     my_ip, my_port = writer_tgt.upstream.get_extra_info('sockname')[:2]
 
@@ -1627,21 +1896,16 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
 
     if not use_ipv6_tg:
         if my_ip_info["ipv4"]:
-            # prefer global ip settings to work behind NAT
             my_ip = my_ip_info["ipv4"]
-
         tg_ip_bytes = socket.inet_pton(socket.AF_INET, tg_ip)[::-1]
         my_ip_bytes = socket.inet_pton(socket.AF_INET, my_ip)[::-1]
-
         tg_ipv6_bytes = None
         my_ipv6_bytes = None
     else:
         if my_ip_info["ipv6"]:
             my_ip = my_ip_info["ipv6"]
-
         tg_ip_bytes = None
         my_ip_bytes = None
-
         tg_ipv6_bytes = socket.inet_pton(socket.AF_INET6, tg_ip)
         my_ipv6_bytes = socket.inet_pton(socket.AF_INET6, my_ip)
 
@@ -1658,13 +1922,12 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
         clt_port=my_port_bytes, purpose=b"SERVER", clt_ip=my_ip_bytes, srv_port=tg_port_bytes,
         middleproxy_secret=PROXY_SECRET, clt_ipv6=my_ipv6_bytes, srv_ipv6=tg_ipv6_bytes)
 
-    encryptor = create_aes_cbc(key=enc_key, iv=enc_iv)  # type: ignore
-    decryptor = create_aes_cbc(key=dec_key, iv=dec_iv)  # type: ignore
+    encryptor = create_aes_cbc(key=enc_key, iv=enc_iv)
+    decryptor = create_aes_cbc(key=dec_key, iv=dec_iv)
 
     SENDER_PID = b"IPIPPRPDTIME"
-    PEER_PID = b"IPIPPRPDTIME"
+    PEER_PID   = b"IPIPPRPDTIME"
 
-    # TODO: pass client ip and port here for statistics
     handshake = RPC_HANDSHAKE + RPC_FLAGS + SENDER_PID + PEER_PID
 
     writer_tgt.upstream = CryptoWrappedStreamWriter(writer_tgt.upstream, encryptor, block_size=16)
@@ -1686,10 +1949,9 @@ async def middleproxy_handshake(host, port, reader_tgt, writer_tgt):
 
 
 async def do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port):
-    global my_ip_info
-    global tg_connection_pool
+    global my_ip_info, tg_connection_pool
 
-    use_ipv6_tg = (my_ip_info["ipv6"] and (config.PREFER_IPV6 or not my_ip_info["ipv4"]))  # type: ignore
+    use_ipv6_tg = (my_ip_info["ipv6"] and (config.PREFER_IPV6 or not my_ip_info["ipv4"]))
 
     if use_ipv6_tg:
         if dc_idx not in TG_MIDDLE_PROXIES_V6:
@@ -1710,22 +1972,22 @@ async def do_middleproxy_handshake(proto_tag, dc_idx, cl_ip, cl_port):
         candidates = healthy
 
     ret = None
-    for idx, (addr, port) in enumerate(candidates[:config.UPSTREAM_FAILOVER_ATTEMPTS]):  # type: ignore
+    for idx, (addr, port) in enumerate(candidates[:config.UPSTREAM_FAILOVER_ATTEMPTS]):
         if idx > 0:
             update_stats(upstream_failovers=1)
         try:
             ret = await tg_connection_pool.get_connection(addr, port, middleproxy_handshake)
             break
-        except ConnectionRefusedError as E:
+        except ConnectionRefusedError:
             print_err("The Telegram server %d (%s %s) is refusing connections" % (dc_idx, addr, port))
-        except ConnectionAbortedError as E:
-            print_err("The Telegram server connection is bad: %d (%s %s) %s" % (dc_idx, addr, port, E))
-        except (OSError, asyncio.TimeoutError) as E:
+        except ConnectionAbortedError as e:
+            print_err("The Telegram server connection is bad: %d (%s %s) %s" % (dc_idx, addr, port, e))
+        except (OSError, asyncio.TimeoutError):
             print_err("Unable to connect to the Telegram server %d (%s %s)" % (dc_idx, addr, port))
 
     if not ret:
         return False
-    reader_tgt, writer_tgt, my_ip, my_port = ret  # type: ignore
+    reader_tgt, writer_tgt, my_ip, my_port = ret
 
     writer_tgt = ProxyReqStreamWriter(writer_tgt, cl_ip, cl_port, my_ip, my_port, proto_tag)
     reader_tgt = ProxyReqStreamReader(reader_tgt)
@@ -1737,10 +1999,10 @@ async def tg_connect_reader_to_writer(rd, wr, user, rd_buf_size, is_upstream):
     try:
         while True:
             if not is_upstream:
-                data = await asyncio.wait_for(rd.read(rd_buf_size),
-                                              timeout=config.TG_READ_TIMEOUT)  # type: ignore
+                data = await asyncio.wait_for(rd.read(rd_buf_size), timeout=config.TG_READ_TIMEOUT)
             else:
                 data = await rd.read(rd_buf_size)
+
             if isinstance(data, tuple):
                 data, extra = data
             else:
@@ -1758,24 +2020,22 @@ async def tg_connect_reader_to_writer(rd, wr, user, rd_buf_size, is_upstream):
                     update_user_stats(user, octets_from_client=len(data), msgs_from_client=1)
                 else:
                     update_user_stats(user, octets_to_client=len(data), msgs_to_client=1)
-
                 wr.write(data, extra)
                 await wr.drain()
-    except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
-        # print_err(e)
+    except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError):
         pass
 
 
 async def handle_client(reader_clt, writer_clt):
-    set_keepalive(writer_clt.get_extra_info("socket"), config.CLIENT_KEEPALIVE, attempts=3)  # type: ignore
-    set_ack_timeout(writer_clt.get_extra_info("socket"), config.CLIENT_ACK_TIMEOUT)  # type: ignore
+    set_keepalive(writer_clt.get_extra_info("socket"), config.CLIENT_KEEPALIVE, attempts=3)
+    set_ack_timeout(writer_clt.get_extra_info("socket"), config.CLIENT_ACK_TIMEOUT)
     set_bufsizes(writer_clt.get_extra_info("socket"), get_to_tg_bufsize(), get_to_clt_bufsize())
 
     update_stats(connects_all=1)
 
     try:
         clt_data = await asyncio.wait_for(handle_handshake(reader_clt, writer_clt),
-                                          timeout=config.CLIENT_HANDSHAKE_TIMEOUT)  # type: ignore
+                                          timeout=config.CLIENT_HANDSHAKE_TIMEOUT)
     except asyncio.TimeoutError:
         update_stats(handshake_timeouts=1)
         return
@@ -1788,10 +2048,10 @@ async def handle_client(reader_clt, writer_clt):
 
     update_user_stats(user, connects=1)
 
-    connect_directly = (not config.USE_MIDDLE_PROXY or disable_middle_proxy)  # type: ignore
+    connect_directly = (not config.USE_MIDDLE_PROXY or disable_middle_proxy)
 
     if connect_directly:
-        if config.FAST_MODE:  # type: ignore
+        if config.FAST_MODE:
             tg_data = await do_direct_handshake(proto_tag, dc_idx, dec_key_and_iv=enc_key_and_iv)
         else:
             tg_data = await do_direct_handshake(proto_tag, dc_idx)
@@ -1803,17 +2063,13 @@ async def handle_client(reader_clt, writer_clt):
 
     reader_tg, writer_tg = tg_data
 
-    if connect_directly and config.FAST_MODE:  # type: ignore
+    if connect_directly and config.FAST_MODE:
         class FakeEncryptor:
-            def encrypt(self, data):
-                return data
-
+            def encrypt(self, data): return data
         class FakeDecryptor:
-            def decrypt(self, data):
-                return data
-
-        reader_tg.decryptor = FakeDecryptor()  # type: ignore
-        writer_clt.encryptor = FakeEncryptor()  # type: ignore
+            def decrypt(self, data): return data
+        reader_tg.decryptor = FakeDecryptor()
+        writer_clt.encryptor = FakeEncryptor()
 
     if not connect_directly:
         if proto_tag == PROTO_TAG_ABRIDGED:
@@ -1828,29 +2084,25 @@ async def handle_client(reader_clt, writer_clt):
         else:
             return
 
-    tg_to_clt = tg_connect_reader_to_writer(reader_tg, writer_clt, user,
-                                            get_to_clt_bufsize(), False)
-    clt_to_tg = tg_connect_reader_to_writer(reader_clt, writer_tg,
-                                            user, get_to_tg_bufsize(), True)
+    tg_to_clt = tg_connect_reader_to_writer(reader_tg, writer_clt, user, get_to_clt_bufsize(), False)
+    clt_to_tg = tg_connect_reader_to_writer(reader_clt, writer_tg, user, get_to_tg_bufsize(), True)
     task_tg_to_clt = asyncio.ensure_future(tg_to_clt)
     task_clt_to_tg = asyncio.ensure_future(clt_to_tg)
 
     update_user_stats(user, curr_connects=1)
 
     tcp_limit_hit = (
-        user in config.USER_MAX_TCP_CONNS and  # type: ignore
-        user_stats[user]["curr_connects"] > config.USER_MAX_TCP_CONNS[user]  # type: ignore
+        user in config.USER_MAX_TCP_CONNS and
+        user_stats[user]["curr_connects"] > config.USER_MAX_TCP_CONNS[user]
     )
-
     user_expired = (
-        user in config.USER_EXPIRATIONS and  # type: ignore
-        datetime.datetime.now() > config.USER_EXPIRATIONS[user]  # type: ignore
+        user in config.USER_EXPIRATIONS and
+        datetime.datetime.now() > config.USER_EXPIRATIONS[user]
     )
-
     user_data_quota_hit = (
-        user in config.USER_DATA_QUOTA and  # type: ignore
+        user in config.USER_DATA_QUOTA and
         (user_stats[user]["octets_to_client"] +
-         user_stats[user]["octets_from_client"] > config.USER_DATA_QUOTA[user])  # type: ignore
+         user_stats[user]["octets_from_client"] > config.USER_DATA_QUOTA[user])
     )
 
     if (not tcp_limit_hit) and (not user_expired) and (not user_data_quota_hit):
@@ -1859,21 +2111,18 @@ async def handle_client(reader_clt, writer_clt):
         update_durations(time.time() - start)
 
     update_user_stats(user, curr_connects=-1)
-
     task_tg_to_clt.cancel()
     task_clt_to_tg.cancel()
-
     writer_tg.transport.abort()
 
 
 async def handle_client_wrapper(reader, writer):
     global active_client_sem
-
     acquired = False
     try:
         if active_client_sem is not None:
             try:
-                await asyncio.wait_for(active_client_sem.acquire(), timeout=config.ACCEPT_QUEUE_TIMEOUT)  # type: ignore
+                await asyncio.wait_for(active_client_sem.acquire(), timeout=config.ACCEPT_QUEUE_TIMEOUT)
                 acquired = True
             except asyncio.TimeoutError:
                 update_stats(connects_dropped_overload=1)
@@ -1887,7 +2136,7 @@ async def handle_client_wrapper(reader, writer):
         traceback.print_exc()
     finally:
         if acquired:
-            active_client_sem.release() # type: ignore
+            active_client_sem.release()
         writer.transport.abort()
 
 
@@ -1896,7 +2145,7 @@ def make_metrics_pkt(metrics):
     used_names = set()
 
     for name, m_type, desc, val in metrics:
-        name = config.METRICS_PREFIX + name  # type: ignore
+        name = config.METRICS_PREFIX + name
         if name not in used_names:
             pkt_body_list.append("# HELP %s %s" % (name, desc))
             pkt_body_list.append("# TYPE %s %s" % (name, m_type))
@@ -1912,6 +2161,7 @@ def make_metrics_pkt(metrics):
             pkt_body_list.append("%s{%s} %s" % (name, ",".join(tags), val["val"]))
         else:
             pkt_body_list.append("%s %s" % (name, val))
+
     pkt_body = "\n".join(pkt_body_list) + "\n"
 
     pkt_header_list = []
@@ -1922,30 +2172,22 @@ def make_metrics_pkt(metrics):
     pkt_header_list.append("Date: %s" % time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()))
 
     pkt_header = "\r\n".join(pkt_header_list)
-
-    pkt = pkt_header + "\r\n\r\n" + pkt_body
-    return pkt
+    return pkt_header + "\r\n\r\n" + pkt_body
 
 
 async def handle_metrics(reader, writer):
-    global stats
-    global user_stats
-    global my_ip_info
-    global proxy_start_time
-    global proxy_links
-    global last_clients_with_time_skew
-    global last_clients_with_same_handshake
+    global stats, user_stats, my_ip_info, proxy_start_time, proxy_links
+    global last_clients_with_time_skew, last_clients_with_same_handshake
 
     client_ip = writer.get_extra_info("peername")[0]
-    if client_ip not in config.METRICS_WHITELIST:  # type: ignore
+    if client_ip not in config.METRICS_WHITELIST:
         writer.close()
         return
 
     try:
         metrics = []
         metrics.append(["uptime", "counter", "proxy uptime", time.time() - proxy_start_time])
-        metrics.append(["connects_bad", "counter", "connects with bad secret",
-                       stats["connects_bad"]])
+        metrics.append(["connects_bad", "counter", "connects with bad secret", stats["connects_bad"]])
         metrics.append(["connects_all", "counter", "incoming connects", stats["connects_all"]])
         metrics.append(["handshake_timeouts", "counter", "number of timed out handshakes",
                        stats["handshake_timeouts"]])
@@ -1963,57 +2205,48 @@ async def handle_metrics(reader, writer):
         for br_state in tg_connection_pool.breakers.values():
             if br_state["open_until"] > now:
                 circuits_open += 1
-        metrics.append(["upstream_circuits_open", "gauge", "currently open upstream circuits",
-                       circuits_open])
-        metrics.append(["upstream_health_healthy", "gauge", "healthy upstreams",
-                       upstream_health_stats["healthy"]])
-        metrics.append(["upstream_health_unhealthy", "gauge", "unhealthy upstreams",
-                       upstream_health_stats["unhealthy"]])
-        for domain in config.TLS_PROBE_DOMAINS:  # type: ignore
+        metrics.append(["upstream_circuits_open", "gauge", "currently open upstream circuits", circuits_open])
+        metrics.append(["upstream_health_healthy",   "gauge", "healthy upstreams",   upstream_health_stats["healthy"]])
+        metrics.append(["upstream_health_unhealthy", "gauge", "unhealthy upstreams", upstream_health_stats["unhealthy"]])
+
+        for domain in config.TLS_PROBE_DOMAINS:
             dom_stat = tls_probe_stats.get(domain, {})
-            metrics.append(["tls_probe_success", "gauge", "tls probe success (1/0)",
+            metrics.append(["tls_probe_success",       "gauge",   "tls probe success (1/0)",
                            {"domain": domain, "val": int(dom_stat.get("success", 0))}])
-            metrics.append(["tls_probe_latency_ms", "gauge", "tls probe latency milliseconds",
+            metrics.append(["tls_probe_latency_ms",    "gauge",   "tls probe latency milliseconds",
                            {"domain": domain, "val": int(dom_stat.get("latency_ms", 0))}])
-            metrics.append(["tls_probe_failures_total", "counter", "tls probe failures count",
+            metrics.append(["tls_probe_failures_total","counter", "tls probe failures count",
                            {"domain": domain, "val": int(dom_stat.get("failures", 0))}])
 
-        if config.METRICS_EXPORT_LINKS:  # type: ignore
+        if config.METRICS_EXPORT_LINKS:
             for link in proxy_links:
                 link_as_metric = link.copy()
                 link_as_metric["val"] = 1
-                metrics.append(["proxy_link_info", "counter",
-                                "the proxy link info", link_as_metric])
+                metrics.append(["proxy_link_info", "counter", "the proxy link info", link_as_metric])
 
         bucket_start = 0
         for bucket in STAT_DURATION_BUCKETS:
             bucket_end = bucket if bucket != STAT_DURATION_BUCKETS[-1] else "+Inf"
-            metric = {
-                "bucket": "%s-%s" % (bucket_start, bucket_end),
-                "val": stats["connects_with_duration_le_%s" % str(bucket)]
-            }
+            metric = {"bucket": "%s-%s" % (bucket_start, bucket_end),
+                      "val": stats["connects_with_duration_le_%s" % str(bucket)]}
             metrics.append(["connects_by_duration", "counter", "connects by duration", metric])
             bucket_start = bucket_end
 
         user_metrics_desc = [
-            ["user_connects", "counter", "user connects", "connects"],
-            ["user_connects_curr", "gauge", "current user connects", "curr_connects"],
-            ["user_octets", "counter", "octets proxied for user",
-                "octets_from_client+octets_to_client"],
-            ["user_msgs", "counter", "msgs proxied for user",
-                "msgs_from_client+msgs_to_client"],
-            ["user_octets_from", "counter", "octets proxied from user", "octets_from_client"],
-            ["user_octets_to", "counter", "octets proxied to user", "octets_to_client"],
-            ["user_msgs_from", "counter", "msgs proxied from user", "msgs_from_client"],
-            ["user_msgs_to", "counter", "msgs proxied to user", "msgs_to_client"],
+            ["user_connects",       "counter", "user connects",             "connects"],
+            ["user_connects_curr",  "gauge",   "current user connects",     "curr_connects"],
+            ["user_octets",         "counter", "octets proxied for user",   "octets_from_client+octets_to_client"],
+            ["user_msgs",           "counter", "msgs proxied for user",     "msgs_from_client+msgs_to_client"],
+            ["user_octets_from",    "counter", "octets proxied from user",  "octets_from_client"],
+            ["user_octets_to",      "counter", "octets proxied to user",    "octets_to_client"],
+            ["user_msgs_from",      "counter", "msgs proxied from user",    "msgs_from_client"],
+            ["user_msgs_to",        "counter", "msgs proxied to user",      "msgs_to_client"],
         ]
 
         for m_name, m_type, m_desc, stat_key in user_metrics_desc:
             for user, stat in user_stats.items():
                 if "+" in stat_key:
-                    val = 0
-                    for key_part in stat_key.split("+"):
-                        val += stat[key_part]
+                    val = sum(stat[k] for k in stat_key.split("+"))
                 else:
                     val = stat[stat_key]
                 metric = {"user": user, "val": val}
@@ -2030,13 +2263,10 @@ async def handle_metrics(reader, writer):
 
 
 async def stats_printer():
-    global user_stats
-    global last_client_ips
-    global last_clients_with_time_skew
-    global last_clients_with_same_handshake
+    global user_stats, last_client_ips, last_clients_with_time_skew, last_clients_with_same_handshake
 
     while True:
-        await asyncio.sleep(config.STATS_PRINT_PERIOD)  # type: ignore
+        await asyncio.sleep(config.STATS_PRINT_PERIOD)
 
         print("Stats for", time.strftime("%d.%m.%Y %H:%M:%S"))
         for user, stat in user_stats.items():
@@ -2059,6 +2289,7 @@ async def stats_printer():
                 print("%s, clocks were %d minutes behind" % (ip, skew_minutes))
             print(flush=True)
             last_clients_with_time_skew.clear()
+
         if last_clients_with_same_handshake:
             print("Clients with duplicate handshake (likely replay-attackers):")
             for ip, times in last_clients_with_same_handshake.items():
@@ -2068,12 +2299,10 @@ async def stats_printer():
 
 
 async def make_https_req(url, host="core.telegram.org"):
-    """ Make request, return resp body and headers. """
     SSL_PORT = 443
     url_data = urllib.parse.urlparse(url)
 
-    HTTP_REQ_TEMPLATE = "\r\n".join(["GET %s HTTP/1.1", "Host: %s",
-                                     "Connection: close"]) + "\r\n\r\n"
+    HTTP_REQ_TEMPLATE = "\r\n".join(["GET %s HTTP/1.1", "Host: %s", "Connection: close"]) + "\r\n\r\n"
     reader, writer = await asyncio.open_connection(url_data.netloc, SSL_PORT, ssl=True)
     req = HTTP_REQ_TEMPLATE % (urllib.parse.quote(url_data.path), host)
     writer.write(req.encode("utf8"))
@@ -2085,8 +2314,7 @@ async def make_https_req(url, host="core.telegram.org"):
 
 
 def gen_tls_client_hello_msg(server_name):
-    msg = bytearray()
-    msg += b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03" + myrandom.getrandbytes(32)
+    msg  = b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03" + myrandom.getrandbytes(32)
     msg += b"\x20" + myrandom.getrandbytes(32)
     msg += b"\x00\x22\x4a\x4a\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9"
     msg += b"\xcc\xa8\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x00\x0a\x01\x00\x01\x91"
@@ -2116,7 +2344,6 @@ async def get_encrypted_cert(host, port, server_name):
                 return 0, b""
             record_len = int.from_bytes(await reader.readexactly(2), "big")
             record = await reader.readexactly(record_len)
-
             return record_type, record
         except asyncio.IncompleteReadError:
             return 0, b""
@@ -2128,11 +2355,9 @@ async def get_encrypted_cert(host, port, server_name):
     record1_type, record1 = await get_tls_record(reader)
     if record1_type != 22:
         return b""
-
     record2_type, record2 = await get_tls_record(reader)
     if record2_type != 20:
         return b""
-
     record3_type, record3 = await get_tls_record(reader)
     if record3_type != 23:
         return b""
@@ -2141,10 +2366,9 @@ async def get_encrypted_cert(host, port, server_name):
         record4_type, record4 = await get_tls_record(reader)
         if record4_type != 23:
             return b""
-        msg = ("The MASK_HOST %s sent some TLS record before certificate record, this makes the " +
-               "proxy more detectable") % config.MASK_HOST  # type: ignore
+        msg = ("The MASK_HOST %s sent some TLS record before certificate record, this makes the "
+               "proxy more detectable") % config.MASK_HOST
         print_err(msg)
-
         return record4
 
     return record3
@@ -2152,80 +2376,73 @@ async def get_encrypted_cert(host, port, server_name):
 
 async def get_mask_host_cert_len():
     global fake_cert_len
-
     GET_CERT_TIMEOUT = 10
     MASK_ENABLING_CHECK_PERIOD = 60
 
     while True:
         try:
-            if not config.MASK:  # type: ignore
-                # do nothing
+            if not config.MASK:
                 await asyncio.sleep(MASK_ENABLING_CHECK_PERIOD)
                 continue
 
-            task = get_encrypted_cert(config.MASK_HOST, config.MASK_PORT, config.TLS_DOMAIN)  # type: ignore
+            task = get_encrypted_cert(config.MASK_HOST, config.MASK_PORT, config.TLS_DOMAIN)
             cert = await asyncio.wait_for(task, timeout=GET_CERT_TIMEOUT)
             if cert:
                 if len(cert) < MIN_CERT_LEN:
                     msg = ("The MASK_HOST %s returned several TLS records, this is not supported" %
-                           config.MASK_HOST)  # type: ignore
+                           config.MASK_HOST)
                     print_err(msg)
                 elif len(cert) != fake_cert_len:
                     fake_cert_len = len(cert)
                     print_err("Got cert from the MASK_HOST %s, its length is %d" %
-                              (config.MASK_HOST, fake_cert_len))  # type: ignore
+                              (config.MASK_HOST, fake_cert_len))
             else:
                 print_err("The MASK_HOST %s is not TLS 1.3 host, this is not recommended" %
-                          config.MASK_HOST)  # type: ignore
+                          config.MASK_HOST)
         except ConnectionRefusedError:
             print_err("The MASK_HOST %s is refusing connections, this is not recommended" %
-                      config.MASK_HOST)  # type: ignore
+                      config.MASK_HOST)
         except (TimeoutError, asyncio.TimeoutError):
             print_err("Got timeout while getting TLS handshake from MASK_HOST %s" %
-                      config.MASK_HOST)  # type: ignore
-        except Exception as E:
-            print_err("Failed to connect to MASK_HOST %s: %s" % (
-                      config.MASK_HOST, E))  # type: ignore
+                      config.MASK_HOST)
+        except Exception as e:
+            print_err("Failed to connect to MASK_HOST %s: %s" % (config.MASK_HOST, e))
 
-        await asyncio.sleep(config.GET_CERT_LEN_PERIOD)  # type: ignore
+        await asyncio.sleep(config.GET_CERT_LEN_PERIOD)
 
 
 async def get_srv_time():
     TIME_SYNC_ADDR = "https://core.telegram.org/getProxySecret"
-    MAX_TIME_SKEW = 30
-
-    global disable_middle_proxy
-    global is_time_skewed
-
+    MAX_TIME_SKEW  = 30
+    global disable_middle_proxy, is_time_skewed
     want_to_reenable_advertising = False
+
     while True:
         try:
             headers, secret = await make_https_req(TIME_SYNC_ADDR)
-
             for line in headers.split(b"\r\n"):
                 if not line.startswith(b"Date: "):
                     continue
-                line = line[len("Date: "):].decode()
+                line     = line[len("Date: "):].decode()
                 srv_time = datetime.datetime.strptime(line, "%a, %d %b %Y %H:%M:%S %Z")
                 srv_time = srv_time.replace(tzinfo=datetime.timezone.utc)
                 now_time = datetime.datetime.now(datetime.timezone.utc)
                 is_time_skewed = (now_time-srv_time).total_seconds() > MAX_TIME_SKEW
-                if is_time_skewed and config.USE_MIDDLE_PROXY and not disable_middle_proxy:  # type: ignore
+                if is_time_skewed and config.USE_MIDDLE_PROXY and not disable_middle_proxy:
                     print_err("Time skew detected, please set the clock")
                     print_err("Server time:", srv_time, "your time:", now_time)
                     print_err("Disabling advertising to continue serving")
                     print_err("Putting down the shields against replay attacks")
-
                     disable_middle_proxy = True
                     want_to_reenable_advertising = True
                 elif not is_time_skewed and want_to_reenable_advertising:
                     print_err("Time is ok, reenabling advertising")
                     disable_middle_proxy = False
                     want_to_reenable_advertising = False
-        except Exception as E:
-            print_err("Error getting server time", E)
+        except Exception as e:
+            print_err("Error getting server time", e)
 
-        await asyncio.sleep(config.GET_TIME_PERIOD)  # type: ignore
+        await asyncio.sleep(config.GET_TIME_PERIOD)
 
 
 async def clear_ip_resolving_cache():
@@ -2242,7 +2459,6 @@ async def update_middle_proxy_info():
         PROXY_REGEXP = re.compile(r"proxy_for\s+(-?\d+)\s+(.+):(\d+)\s*;")
         ans = {}
         headers, body = await make_https_req(url)
-
         fields = PROXY_REGEXP.findall(body.decode("utf8"))
         if fields:
             for dc_idx, host, port in fields:
@@ -2255,13 +2471,11 @@ async def update_middle_proxy_info():
                     ans[dc_idx].append((host, port))
         return ans
 
-    PROXY_INFO_ADDR = "https://core.telegram.org/getProxyConfig"
+    PROXY_INFO_ADDR    = "https://core.telegram.org/getProxyConfig"
     PROXY_INFO_ADDR_V6 = "https://core.telegram.org/getProxyConfigV6"
-    PROXY_SECRET_ADDR = "https://core.telegram.org/getProxySecret"
+    PROXY_SECRET_ADDR  = "https://core.telegram.org/getProxySecret"
 
-    global TG_MIDDLE_PROXIES_V4
-    global TG_MIDDLE_PROXIES_V6
-    global PROXY_SECRET
+    global TG_MIDDLE_PROXIES_V4, TG_MIDDLE_PROXIES_V6, PROXY_SECRET
 
     while True:
         try:
@@ -2269,16 +2483,16 @@ async def update_middle_proxy_info():
             if not v4_proxies:
                 raise Exception("no proxy data")
             TG_MIDDLE_PROXIES_V4 = v4_proxies
-        except Exception as E:
-            print_err("Error updating middle proxy list:", E)
+        except Exception as e:
+            print_err("Error updating middle proxy list:", e)
 
         try:
             v6_proxies = await get_new_proxies(PROXY_INFO_ADDR_V6)
             if not v6_proxies:
                 raise Exception("no proxy data (ipv6)")
             TG_MIDDLE_PROXIES_V6 = v6_proxies
-        except Exception as E:
-            print_err("Error updating middle proxy list for IPv6:", E)
+        except Exception as e:
+            print_err("Error updating middle proxy list for IPv6:", e)
 
         try:
             headers, secret = await make_https_req(PROXY_SECRET_ADDR)
@@ -2287,15 +2501,14 @@ async def update_middle_proxy_info():
             if secret != PROXY_SECRET:
                 PROXY_SECRET = secret
                 print_err("Middle proxy secret updated")
-        except Exception as E:
-            print_err("Error updating middle proxy secret, using old", E)
+        except Exception as e:
+            print_err("Error updating middle proxy secret, using old", e)
 
-        await asyncio.sleep(config.PROXY_INFO_UPDATE_PERIOD)  # type: ignore
+        await asyncio.sleep(config.PROXY_INFO_UPDATE_PERIOD)
 
 
 async def healthcheck_upstreams():
-    global upstream_health
-    global upstream_health_stats
+    global upstream_health, upstream_health_stats
 
     while True:
         targets = []
@@ -2310,138 +2523,123 @@ async def healthcheck_upstreams():
             for host, port in host_ports:
                 targets.append((host, port, middleproxy_handshake))
 
-        if len(targets) > config.UPSTREAM_HEALTHCHECK_SAMPLE:  # type: ignore
-            targets = random.sample(targets, config.UPSTREAM_HEALTHCHECK_SAMPLE)  # type: ignore
+        if len(targets) > config.UPSTREAM_HEALTHCHECK_SAMPLE:
+            targets = random.sample(targets, config.UPSTREAM_HEALTHCHECK_SAMPLE)
 
         healthy = 0
         unhealthy = 0
-
         for host, port, init_func in targets:
             key = (host, port, init_func)
             ok = False
             try:
                 ret = await asyncio.wait_for(
                     tg_connection_pool.open_tg_connection(host, port, init_func),
-                    timeout=config.UPSTREAM_HEALTHCHECK_TIMEOUT  # type: ignore
+                    timeout=config.UPSTREAM_HEALTHCHECK_TIMEOUT
                 )
                 _, writer, *_ = ret
                 writer.transport.abort()
                 ok = True
             except Exception:
                 ok = False
-
             upstream_health[key] = {"ok": ok, "updated_at": time.time()}
             if ok:
                 healthy += 1
             else:
                 unhealthy += 1
 
-        upstream_health_stats["healthy"] = healthy
+        upstream_health_stats["healthy"]   = healthy
         upstream_health_stats["unhealthy"] = unhealthy
 
-        await asyncio.sleep(config.UPSTREAM_HEALTHCHECK_PERIOD)  # type: ignore
+        await asyncio.sleep(config.UPSTREAM_HEALTHCHECK_PERIOD)
 
 
 async def tls_probe_rotator():
     global tls_probe_stats, tls_probe_history, mask_host_cached_ip
 
-    if not config.TLS_PROBE_DOMAINS: # type: ignore
+    if not config.TLS_PROBE_DOMAINS:
         return
 
-    for domain in config.TLS_PROBE_DOMAINS:  # type: ignore
+    for domain in config.TLS_PROBE_DOMAINS:
         tls_probe_stats.setdefault(domain, {"success": 0, "latency_ms": 0, "failures": 0})
         tls_probe_history.setdefault(domain, collections.deque())
 
     ssl_ctx = ssl.create_default_context()
     while True:
-        now = time.time()
+        now    = time.time()
         cutoff = now - get_tls_probe_window_seconds()
 
-        for domain in config.TLS_PROBE_DOMAINS:  # type: ignore
+        for domain in config.TLS_PROBE_DOMAINS:
             start = time.time()
-            ok = False
+            ok    = False
             try:
                 task = asyncio.open_connection(domain, 443, ssl=ssl_ctx, server_hostname=domain)
-                reader, writer = await asyncio.wait_for(task, timeout=config.TLS_PROBE_TIMEOUT)  # type: ignore
+                reader, writer = await asyncio.wait_for(task, timeout=config.TLS_PROBE_TIMEOUT)
                 writer.close()
                 ok = True
             except Exception:
                 ok = False
 
             latency_ms = int((time.time() - start) * 1000)
-            tls_probe_stats[domain]["success"] = 1 if ok else 0
+            tls_probe_stats[domain]["success"]    = 1 if ok else 0
             tls_probe_stats[domain]["latency_ms"] = latency_ms
             if not ok:
                 tls_probe_stats[domain]["failures"] += 1
 
-            # записать в скользящую историю, убрать устаревшее
             tls_probe_history[domain].append((time.time(), ok, latency_ms))
             while (tls_probe_history[domain] and
                    tls_probe_history[domain][0][0] < cutoff):
                 tls_probe_history[domain].popleft()
 
-        # выбрать лучший домен и переключить TLS_DOMAIN при необходимости
         best = pick_best_tls_domain()
-        if best and best != config.TLS_DOMAIN: # type: ignore
-            old_domain = config.TLS_DOMAIN # pyright: ignore[reportAttributeAccessIssue]
-            # если MASK_HOST был привязан к TLS_DOMAIN — обновить и его
-            auto_mask = (config.MASK_HOST == old_domain) # pyright: ignore[reportAttributeAccessIssue]
-            config.TLS_DOMAIN = best # pyright: ignore[reportAttributeAccessIssue]
+        if best and best != config.TLS_DOMAIN:
+            old_domain = config.TLS_DOMAIN
+            auto_mask  = (config.MASK_HOST == old_domain)
+            config.TLS_DOMAIN = best
             if auto_mask:
-                config.MASK_HOST = best # pyright: ignore[reportAttributeAccessIssue]
-                mask_host_cached_ip = None   # сбросить кэш IP маски
+                config.MASK_HOST      = best
+                mask_host_cached_ip   = None
             print_err(
                 "TLS_DOMAIN auto-switched: %s -> %s "
                 "(best probe rating for the last %sh)" % (
-                    old_domain,
-                    best,
-                    config.TLS_PROBE_HISTORY_HOURS,  # type: ignore
+                    old_domain, best, config.TLS_PROBE_HISTORY_HOURS,
                 )
             )
 
-        await asyncio.sleep(config.TLS_PROBE_ROTATION_PERIOD) # pyright: ignore[reportAttributeAccessIssue]
+        await asyncio.sleep(config.TLS_PROBE_ROTATION_PERIOD)
 
 
 def pick_best_tls_domain():
-    """Return the domain with the best rolling availability score.
-
-    Domains are ranked by:
-    1. success rate during the recent rolling window
-    2. number of successful probes
-    3. average latency of successful probes
-    4. keeping the current TLS_DOMAIN on ties
-    """
-    now = time.time()
-    cutoff = now - get_tls_probe_window_seconds()
-    min_samples = max(1, int(config.TLS_PROBE_MIN_SAMPLES))  # type: ignore
+    now         = time.time()
+    cutoff      = now - get_tls_probe_window_seconds()
+    min_samples = max(1, int(config.TLS_PROBE_MIN_SAMPLES))
     best_domain = None
-    best_rank = None
+    best_rank   = None
 
     for domain, entries in tls_probe_history.items():
         window = [(s, l) for ts, s, l in entries if ts >= cutoff]
         if len(window) < min_samples:
             continue
-        total = len(window)
-        successes = sum(s for s, _ in window)
+        total        = len(window)
+        successes    = sum(s for s, _ in window)
         success_rate = successes / total
-        good_latencies = [l for s, l in window if s]
-        avg_latency_ms = (sum(good_latencies) / len(good_latencies)
-                          if good_latencies else float("inf"))
-        prefer_current = 1 if domain == config.TLS_DOMAIN else 0  # type: ignore
+        good_latencies  = [l for s, l in window if s]
+        avg_latency_ms  = (sum(good_latencies) / len(good_latencies)
+                           if good_latencies else float("inf"))
+        prefer_current  = 1 if domain == config.TLS_DOMAIN else 0
         rank = (success_rate, successes, -avg_latency_ms, prefer_current)
         if best_rank is None or rank > best_rank:
-            best_rank = rank
+            best_rank   = rank
             best_domain = domain
 
     return best_domain
 
 
 def get_tls_probe_window_seconds():
-    return max(1, int(config.TLS_PROBE_HISTORY_HOURS)) * 60 * 60  # type: ignore
+    return max(1, int(config.TLS_PROBE_HISTORY_HOURS)) * 60 * 60
+
 
 def init_ip_info():
-    global my_ip_info
-    global disable_middle_proxy
+    global my_ip_info, disable_middle_proxy
 
     def get_ip_from_url(url):
         TIMEOUT = 5
@@ -2455,14 +2653,12 @@ def init_ip_info():
 
     IPV4_URL1 = "http://v4.ident.me/"
     IPV4_URL2 = "http://ipv4.icanhazip.com/"
-
     IPV6_URL1 = "http://v6.ident.me/"
     IPV6_URL2 = "http://ipv6.icanhazip.com/"
 
     my_ip_info["ipv4"] = get_ip_from_url(IPV4_URL1) or get_ip_from_url(IPV4_URL2)
     my_ip_info["ipv6"] = get_ip_from_url(IPV6_URL1) or get_ip_from_url(IPV6_URL2)
 
-    # the server can return ipv4 address instead of ipv6
     if my_ip_info["ipv6"] and ":" not in my_ip_info["ipv6"]:
         my_ip_info["ipv6"] = None
 
@@ -2476,8 +2672,7 @@ def init_ip_info():
 
 
 def print_tg_info():
-    global my_ip_info
-    global proxy_links
+    global my_ip_info, proxy_links
 
     print_default_warning = False
 
@@ -2496,9 +2691,9 @@ def print_tg_info():
 
     proxy_links = []
 
-    for user, secret in sorted(config.USERS.items(), key=lambda x: x[0]): # pyright: ignore[reportAttributeAccessIssue]
+    for user, secret in sorted(config.USERS.items(), key=lambda x: x[0]):
         for ip in ip_addrs:
-            if config.MODES["classic"]: # pyright: ignore[reportAttributeAccessIssue]
+            if config.MODES["classic"]:
                 params = {"server": ip, "port": config.PORT, "secret": secret}
                 params_encoded = urllib.parse.urlencode(params, safe=':')
                 classic_link = "tg://proxy?{}".format(params_encoded)
@@ -2512,14 +2707,11 @@ def print_tg_info():
                 proxy_links.append({"user": user, "link": dd_link})
                 print("{}: {}".format(user, dd_link), flush=True)
 
-            if config.MODES["tls"]: # pyright: ignore[reportAttributeAccessIssue]
-                tls_secret = "ee" + secret + config.TLS_DOMAIN.encode().hex()
-                # the base64 links is buggy on ios
-                # tls_secret = bytes.fromhex("ee" + secret) + config.TLS_DOMAIN.encode()
-                # tls_secret_base64 = base64.urlsafe_b64encode(tls_secret)
-                params = {"server": ip, "port": config.PORT, "secret": tls_secret}
+            if config.MODES["tls"]:
+                tls_secret    = "ee" + secret + config.TLS_DOMAIN.encode().hex()
+                params        = {"server": ip, "port": config.PORT, "secret": tls_secret}
                 params_encoded = urllib.parse.urlencode(params, safe=':')
-                tls_link = "tg://proxy?{}".format(params_encoded)
+                tls_link      = "tg://proxy?{}".format(params_encoded)
                 proxy_links.append({"user": user, "link": tls_link})
                 print("{}: {}".format(user, tls_link), flush=True)
 
@@ -2553,8 +2745,7 @@ def setup_files_limit():
 
 
 def setup_asyncio():
-    # get rid of annoying "socket.send() raised exception" log messages
-    asyncio.constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES = 100 # pyright: ignore[reportAttributeAccessIssue]
+    asyncio.constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES = 100
 
 
 def setup_signals():
@@ -2562,7 +2753,6 @@ def setup_signals():
         def debug_signal(signum, frame):
             import pdb
             pdb.set_trace()
-
         signal.signal(signal.SIGUSR1, debug_signal)
 
     if hasattr(signal, 'SIGUSR2'):
@@ -2572,15 +2762,14 @@ def setup_signals():
             apply_upstream_proxy_settings()
             print("Config reloaded", flush=True, file=sys.stderr)
             print_tg_info()
-
         signal.signal(signal.SIGUSR2, reload_signal)
+
 
 def try_setup_uvloop():
     if config.SOCKS5_HOST and config.SOCKS5_PORT:
-        # socks mode is not compatible with uvloop
         return
     try:
-        import uvloop  # type: ignore
+        import uvloop
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         print_err("Found uvloop, using it for optimal performance")
     except ImportError:
@@ -2604,30 +2793,21 @@ def loop_exception_handler(loop, context):
                 transport.abort()
                 return
         if isinstance(exception, OSError):
-            IGNORE_ERRNO = {
-                10038,  # operation on non-socket on Windows, likely because fd == -1
-                121,    # the semaphore timeout period has expired on Windows
-            }
-
-            FORCE_CLOSE_ERRNO = {
-                113,    # no route to host
-
-            }
+            IGNORE_ERRNO = {10038, 121}
+            FORCE_CLOSE_ERRNO = {113}
             if exception.errno in IGNORE_ERRNO:
                 return
             elif exception.errno in FORCE_CLOSE_ERRNO:
                 if transport:
                     transport.abort()
                     return
-
     loop.default_exception_handler(context)
 
 
 def create_servers(loop):
     servers = []
-
     reuse_port = hasattr(socket, "SO_REUSEPORT")
-    has_unix = hasattr(socket, "AF_UNIX")
+    has_unix   = hasattr(socket, "AF_UNIX")
 
     if config.LISTEN_ADDR_IPV4:
         task = asyncio.start_server(handle_client_wrapper, config.LISTEN_ADDR_IPV4, config.PORT,
@@ -2668,15 +2848,15 @@ def create_utilitary_tasks(loop):
     if config.UPSTREAM_HEALTHCHECK_PERIOD > 0 and config.UPSTREAM_HEALTHCHECK_SAMPLE > 0:
         healthcheck_task = asyncio.Task(healthcheck_upstreams(), loop=loop)
         tasks.append(healthcheck_task)
+
     if config.TLS_PROBE_DOMAINS and config.TLS_PROBE_ROTATION_PERIOD > 0:
         tls_probe_task = asyncio.Task(tls_probe_rotator(), loop=loop)
         tasks.append(tls_probe_task)
 
-    if config.USE_MIDDLE_PROXY: # type: ignore
+    if config.USE_MIDDLE_PROXY:
         middle_proxy_updater_task = asyncio.Task(update_middle_proxy_info(), loop=loop)
         tasks.append(middle_proxy_updater_task)
-
-        if config.GET_TIME_PERIOD: # pyright: ignore[reportAttributeAccessIssue]
+        if config.GET_TIME_PERIOD:
             time_get_task = asyncio.Task(get_srv_time(), loop=loop)
             tasks.append(time_get_task)
 
@@ -2704,8 +2884,8 @@ def main():
     try_setup_uvloop()
 
     init_proxy_start_time()
-    if config.MAX_ACTIVE_CLIENTS > 0:  # type: ignore
-        active_client_sem = asyncio.Semaphore(config.MAX_ACTIVE_CLIENTS)  # type: ignore
+    if config.MAX_ACTIVE_CLIENTS > 0:
+        active_client_sem = asyncio.Semaphore(config.MAX_ACTIVE_CLIENTS)
 
     if sys.platform == "win32":
         loop = asyncio.ProactorEventLoop()
@@ -2729,24 +2909,56 @@ def main():
     if hasattr(asyncio, "all_tasks"):
         tasks = asyncio.all_tasks(loop)
     else:
-        # for compatibility with Python 3.6
-        tasks = asyncio.Task.all_tasks(loop) # pyright: ignore[reportAttributeAccessIssue]
+        tasks = asyncio.Task.all_tasks(loop)
 
     for task in tasks:
         task.cancel()
 
-        
     for server in servers:
         server.close()
         loop.run_until_complete(server.wait_closed())
 
     has_unix = hasattr(socket, "AF_UNIX")
-
-    if config.LISTEN_UNIX_SOCK and has_unix: # pyright: ignore[reportAttributeAccessIssue]
-        remove_unix_socket(config.LISTEN_UNIX_SOCK) # type: ignore
+    if config.LISTEN_UNIX_SOCK and has_unix:
+        remove_unix_socket(config.LISTEN_UNIX_SOCK)
 
     loop.close()
 
 
 if __name__ == "__main__":
     main()
+SETUPEOF_MTPROTO
+
+# ── git ───────────────────────────────────────────────────────────────────────
+info "Инициализирую git-репозиторий…"
+if [ ! -d .git ]; then
+    git init -q
+fi
+
+# Fallback identity если git user не настроен глобально
+if ! git config user.email &>/dev/null; then
+    git config user.email "deploy@localhost"
+    git config user.name  "deploy"
+fi
+
+# Убеждаемся, что .env исключён из-под любого состояния репозитория
+grep -qxF '.env' .gitignore 2>/dev/null || echo '.env' >> .gitignore
+
+git add .
+git commit -q -m "chore: initial mtprotoproxy setup (secrets via env)"
+
+# ── итог ──────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GREEN}✓ Репозиторий готов в ${REPO_DIR}${NC}"
+echo ""
+echo "Следующие шаги:"
+echo ""
+echo "  1.  cd ${REPO_DIR}"
+echo "  2.  cp .env.example .env"
+echo "  3.  # Вставьте свежий секрет:"
+echo "      echo \"MTPROTO_SECRET=\$(openssl rand -hex 16)\" >> .env"
+echo "  4.  nano .env   # убедитесь, что PORT=443 и TLS_DOMAIN=vk.com"
+echo "  5.  docker compose up -d --build"
+echo "  6.  docker compose logs --tail=80"
+echo ""
+echo -e "${YELLOW}[!]${NC} Не забудьте: ufw allow 443/tcp (или ваш порт) до запуска."
