@@ -150,3 +150,85 @@ docker image prune -f               # подчистить старые обра
 Prometheus-эндпойнт доступен только локально на `127.0.0.1:9090`. Чтобы
 собирать метрики, ставьте Prometheus на этом же сервере или пробрасывайте порт
 по SSH-туннелю. Правила алертов — в `prometheus-alerts.yml`.
+
+---
+
+## 9. Устойчивость: три механизма
+
+### Feature 1 — уведомления об ошибках на почту (msmtp + Gmail)
+
+При старте выполняется самопроверка (**doctor**): резолв и доступность
+`MASK_HOST`, резолв `TLS_DOMAIN`, наличие `msmtp`. Любая нестандартная ошибка
+в event-loop тоже триггерит письмо. Частота — **не чаще одного письма раз в 12
+часов** (`ALERT_MIN_INTERVAL`), чтобы не спамить.
+
+Письма уходят через `msmtp` с Gmail app-паролем. **Пароль не хранится в
+репозитории** — он в `~/.msmtprc`, который монтируется в контейнер.
+
+1. Включите 2FA в Google-аккаунте и создайте app-password
+   (Google Account → Security → App passwords).
+2. Создайте `./msmtprc` рядом с `docker-compose.yml`:
+
+   ```ini
+   defaults
+   auth           on
+   tls            on
+   tls_trust_file /etc/ssl/certs/ca-certificates.crt
+   logfile        ~/.msmtp.log
+
+   account        gmail
+   host           smtp.gmail.com
+   port           587
+   from           your_account@gmail.com
+   user           your_account@gmail.com
+   password       APP_PASSWORD_БЕЗ_ПРОБЕЛОВ
+
+   account default : gmail
+   ```
+
+   ```bash
+   chmod 600 ./msmtprc        # обязательно, иначе msmtp откажется работать
+   ```
+
+3. Раскомментируйте монтаж в `docker-compose.yml`:
+
+   ```yaml
+   - ./msmtprc:/home/tgproxy/.msmtprc:ro
+   ```
+
+4. В `.env` задайте получателя:
+
+   ```bash
+   MTPROTO_ALERT_EMAIL=your_account@gmail.com
+   ```
+
+`./msmtprc` тоже **не коммитим** (добавлен в `.gitignore`). Проверка вручную из
+контейнера: `docker compose exec mtprotoproxy sh -c 'echo test | msmtp -- you@gmail.com'`.
+
+### Feature 2 — лимит клиентов и отсечение зондов
+
+- `MAX_ACTIVE_CLIENTS = 10` — не более 10 клиентов одновременно (глобально).
+- `MAX_CONNS_PER_IP = 8` — не более 8 TCP-соединений с одного IP.
+- **Отсечение зондов и одноразовых IP.** IP, который прислал плохой/пустой
+  handshake (сканеры, DPI-зонды), помечается и **жёстко отбрасывается (RST)** на
+  `PROBE_BAN_SECS` (по умолчанию 30 мин). Достаточно одного плохого handshake
+  (`PROBE_FAIL_THRESHOLD = 1`). Реальный клиент после валидного MTProto-handshake
+  становится «доверенным» и под бан не попадает **никогда** — поэтому легитимные
+  новые пользователи не блокируются, а одноразовые зонды отсекаются дёшево.
+- Память ограничена `IP_GREYLIST_LEN` (LRU), без утечек.
+- Новые метрики Prometheus: `connects_dropped_probe`, `connects_dropped_per_ip`,
+  `probe_ips_banned`.
+
+### Feature 3 — мимикрия размеров TLS-записей
+
+Раньше длина фейкового «сертификата» в fake-TLS ServerHello была случайной до
+первого асинхронного запроса к `MASK_HOST`. Теперь:
+
+- размеры реальных app-data записей `MASK_HOST` запоминаются и **точно
+  воспроизводятся** в нашем ServerHello (приближает статистику к настоящему
+  сайту, как DRS в mtg);
+- длина забирается **синхронно на старте** (`TLS_MIMIC_PRIME_ON_START`), поэтому
+  даже первые клиенты получают правдоподобный ответ — нет «окна» со случайной
+  длиной.
+
+Отключается флагами `TLS_MIMIC_RECORD_SIZES` / `TLS_MIMIC_PRIME_ON_START`.

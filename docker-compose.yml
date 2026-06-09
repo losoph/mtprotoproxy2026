@@ -11,6 +11,10 @@ services:
         - ./config.py:/home/tgproxy/config.py
         - ./mtprotoproxy.py:/home/tgproxy/mtprotoproxy.py
         - /etc/localtime:/etc/localtime:ro
+        # Email alerting (Feature 1): mount your msmtp config read-only so the
+        # container can send mail. Create ./msmtprc with your Gmail app password
+        # (see DEPLOY.md) and uncomment the line below. chmod 600 ./msmtprc.
+        # - ./msmtprc:/home/tgproxy/.msmtprc:ro
     logging:
         driver: "json-file"
         options:

@@ -20,6 +20,8 @@ import os
 import stat
 import traceback
 import ssl
+import subprocess
+import shutil
 
 
 TG_DATACENTER_PORT = 443
@@ -116,6 +118,18 @@ upstream_health_stats = collections.Counter()
 active_client_sem = None
 tls_probe_stats = {}
 tls_probe_history = {}          # domain -> deque of (timestamp, success, latency_ms)
+
+# Feature 1: throttled email alerting
+last_alert_time = 0.0
+
+# Feature 2: per-IP connection limiter / probe greylist
+ip_conn_counts = collections.Counter()           # ip -> current concurrent conns
+ip_probe_bans = collections.OrderedDict()        # ip -> ban_until_ts
+ip_trusted = collections.OrderedDict()           # ip -> True (completed a real handshake)
+ip_probe_fails = collections.OrderedDict()       # ip -> consecutive bad-handshake count
+
+# Feature 3: real MASK_HOST app-data record sizes, replayed in the fake ServerHello
+mask_host_record_sizes = []
 
 def init_config():
     global config
@@ -333,6 +347,34 @@ def init_config():
     conf_dict.setdefault("TLS_PROBE_HISTORY_HOURS", 6)
     conf_dict.setdefault("TLS_PROBE_MIN_SAMPLES", 3)
 
+    # --- Feature 1: email alerting via msmtp (throttled) ---
+    # recipient of alert emails; empty disables alerting entirely
+    conf_dict.setdefault("ALERT_EMAIL", "")
+    # From: header (defaults to recipient if empty)
+    conf_dict.setdefault("ALERT_EMAIL_FROM", "")
+    # minimal interval between two alert emails, seconds (default 12h)
+    conf_dict.setdefault("ALERT_MIN_INTERVAL", 12 * 60 * 60)
+    # path to the msmtp binary
+    conf_dict.setdefault("ALERT_MSMTP_PATH", "msmtp")
+    # run startup self-check ("doctor") and alert about found issues
+    conf_dict.setdefault("DOCTOR_ENABLED", True)
+
+    # --- Feature 2: per-IP limits / probe cutoff ---
+    # max simultaneous tcp connections from a single source IP
+    conf_dict.setdefault("MAX_CONNS_PER_IP", 8)
+    # how long (seconds) to hard-drop an IP that only ever sent bad handshakes
+    conf_dict.setdefault("PROBE_BAN_SECS", 10 * 60)
+    # number of bad handshakes from an untrusted IP before it gets banned
+    conf_dict.setdefault("PROBE_FAIL_THRESHOLD", 1)
+    # bounded memory for greylist / trusted-ip bookkeeping
+    conf_dict.setdefault("IP_GREYLIST_LEN", 65536)
+
+    # --- Feature 3: TLS record-size mimicry ---
+    # replay the MASK_HOST's real app-data record sizes in the fake ServerHello
+    conf_dict.setdefault("TLS_MIMIC_RECORD_SIZES", True)
+    # fetch the real cert length synchronously at startup (no random first window)
+    conf_dict.setdefault("TLS_MIMIC_PRIME_ON_START", True)
+
     # allow access to config by attributes
     config = Config(conf_dict)
 
@@ -459,6 +501,135 @@ except ImportError:
 
 def print_err(*params):
     print(*params, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: throttled email alerting via msmtp
+# ---------------------------------------------------------------------------
+def _send_alert_email_sync(subject, body):
+    """Blocking: build an RFC822 message and hand it to msmtp on stdin."""
+    global last_alert_time
+
+    recipient = config.get("ALERT_EMAIL")  # type: ignore
+    if not recipient:
+        return
+
+    now = time.time()
+    if now - last_alert_time < config.get("ALERT_MIN_INTERVAL", 12 * 3600):  # type: ignore
+        # still inside the cooldown window, drop this alert silently
+        return
+    # reserve the slot before sending so concurrent callers don't both fire
+    last_alert_time = now
+
+    msmtp_path = config.get("ALERT_MSMTP_PATH", "msmtp")  # type: ignore
+    if shutil.which(msmtp_path) is None:
+        print_err("ALERT: msmtp binary '%s' not found, cannot send email" % msmtp_path)
+        return
+
+    sender = config.get("ALERT_EMAIL_FROM") or recipient  # type: ignore
+    date_hdr = time.strftime("%a, %d %b %Y %H:%M:%S %z")
+    host = socket.gethostname()
+    message = (
+        "From: %s\r\n"
+        "To: %s\r\n"
+        "Subject: [mtproxy %s] %s\r\n"
+        "Date: %s\r\n"
+        "\r\n"
+        "%s\r\n"
+    ) % (sender, recipient, host, subject, date_hdr, body)
+
+    try:
+        subprocess.run(
+            [msmtp_path, "--read-envelope-from", "--", recipient],
+            input=message.encode("utf-8"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=30, check=True,
+        )
+        print_err("ALERT email sent to %s: %s" % (recipient, subject))
+    except Exception as e:
+        # don't let alerting failures kill the proxy; allow a retry next time
+        last_alert_time = 0.0
+        print_err("ALERT: failed to send email via msmtp: %s" % e)
+
+
+def report_error(subject, body=None):
+    """Central alert hook: log to stderr and email (throttled to 1/ALERT_MIN_INTERVAL).
+
+    Safe to call from both sync (startup) and async contexts.
+    """
+    body = body if body is not None else subject
+    print_err("ERROR:", subject)
+    if not config.get("ALERT_EMAIL"):  # type: ignore
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        # never block the event loop on the subprocess call
+        loop.run_in_executor(None, _send_alert_email_sync, subject, body)
+    else:
+        _send_alert_email_sync(subject, body)
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: per-IP connection limiter and probe greylist
+# ---------------------------------------------------------------------------
+def _bounded_set(od, key, value=True):
+    od[key] = value
+    limit = config.get("IP_GREYLIST_LEN", 65536)  # type: ignore
+    while len(od) > limit:
+        od.popitem(last=False)
+
+
+def ip_is_banned(ip):
+    """True if the IP is an untrusted probe currently inside its ban window."""
+    if ip in ip_trusted:
+        return False
+    ban_until = ip_probe_bans.get(ip)
+    if ban_until is None:
+        return False
+    if ban_until > time.time():
+        return True
+    # ban expired
+    del ip_probe_bans[ip]
+    ip_probe_fails.pop(ip, None)
+    return False
+
+
+def ip_record_probe(ip):
+    """Register a bad handshake; ban the IP once it crosses the threshold."""
+    if ip in ip_trusted:
+        return
+    fails = ip_probe_fails.get(ip, 0) + 1
+    _bounded_set(ip_probe_fails, ip, fails)
+    if fails >= config.get("PROBE_FAIL_THRESHOLD", 1):  # type: ignore
+        ban_until = time.time() + config.get("PROBE_BAN_SECS", 600)  # type: ignore
+        _bounded_set(ip_probe_bans, ip, ban_until)
+        update_stats(probe_ips_banned=1)
+
+
+def ip_mark_trusted(ip):
+    """A real handshake completed: whitelist the IP and clear any suspicion."""
+    _bounded_set(ip_trusted, ip)
+    ip_probe_bans.pop(ip, None)
+    ip_probe_fails.pop(ip, None)
+
+
+def ip_acquire_slot(ip):
+    """Reserve a per-IP connection slot. False if the IP is over its limit."""
+    limit = config.get("MAX_CONNS_PER_IP", 8)  # type: ignore
+    if limit > 0 and ip_conn_counts[ip] >= limit:
+        return False
+    ip_conn_counts[ip] += 1
+    return True
+
+
+def ip_release_slot(ip):
+    if ip_conn_counts[ip] <= 1:
+        del ip_conn_counts[ip]
+    else:
+        ip_conn_counts[ip] -= 1
 
 
 def ensure_users_in_user_stats():
@@ -1288,15 +1459,24 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
             last_clients_with_time_skew[peer[0]] = (time.time() - timestamp) // 60
             continue
 
-        http_data = myrandom.getrandbytes(fake_cert_len)
-
         srv_hello = TLS_VERS + b"\x00"*DIGEST_LEN + bytes([sess_id_len]) + sess_id
         srv_hello += TLS_CIPHERSUITE + b"\x00" + tls_extensions
 
         hello_pkt = b"\x16" + TLS_VERS + int.to_bytes(len(srv_hello) + 4, 2, "big")
         hello_pkt += b"\x02" + int.to_bytes(len(srv_hello), 3, "big") + srv_hello
-        hello_pkt += TLS_CHANGE_CIPHER + TLS_APP_HTTP2_HDR
-        hello_pkt += int.to_bytes(len(http_data), 2, "big") + http_data
+        hello_pkt += TLS_CHANGE_CIPHER
+
+        # Feature 3: emit welcome app-data records mimicking the real MASK_HOST
+        # record-size pattern; fall back to one record of fake_cert_len.
+        if config.TLS_MIMIC_RECORD_SIZES and mask_host_record_sizes:  # type: ignore
+            record_sizes = mask_host_record_sizes
+        else:
+            record_sizes = [fake_cert_len]
+
+        for rec_size in record_sizes:
+            rec_size = max(0, min(rec_size, 16384))
+            hello_pkt += TLS_APP_HTTP2_HDR + int.to_bytes(rec_size, 2, "big")
+            hello_pkt += myrandom.getrandbytes(rec_size)
 
         computed_digest = hmac.new(secret, msg=digest+hello_pkt, digestmod=hashlib.sha256).digest()
         hello_pkt = hello_pkt[:DIGEST_POS] + computed_digest + hello_pkt[DIGEST_POS+DIGEST_LEN:]
@@ -1773,18 +1953,31 @@ async def handle_client(reader_clt, writer_clt):
 
     update_stats(connects_all=1)
 
+    # immediate TCP source IP, used by the per-IP probe greylist (Feature 2)
+    src_peer = writer_clt.get_extra_info("peername")
+    src_ip = src_peer[0] if src_peer else None
+
     try:
         clt_data = await asyncio.wait_for(handle_handshake(reader_clt, writer_clt),
                                           timeout=config.CLIENT_HANDSHAKE_TIMEOUT)  # type: ignore
     except asyncio.TimeoutError:
         update_stats(handshake_timeouts=1)
+        if src_ip:
+            ip_record_probe(src_ip)
         return
 
     if not clt_data:
+        # bad secret / probe / scanner: remember it so repeats get cut off cheaply
+        if src_ip:
+            ip_record_probe(src_ip)
         return
 
     reader_clt, writer_clt, proto_tag, user, dc_idx, enc_key_and_iv, peer = clt_data
     cl_ip, cl_port = peer
+
+    # a valid MTProto handshake -> this IP is a real client, trust it from now on
+    if src_ip:
+        ip_mark_trusted(src_ip)
 
     update_user_stats(user, connects=1)
 
@@ -1869,6 +2062,22 @@ async def handle_client(reader_clt, writer_clt):
 async def handle_client_wrapper(reader, writer):
     global active_client_sem
 
+    # Feature 2: drop known probes and over-limit IPs before doing any work
+    src_peer = writer.get_extra_info("peername")
+    src_ip = src_peer[0] if src_peer else None
+    ip_slot = False
+    if src_ip is not None:
+        if ip_is_banned(src_ip):
+            update_stats(connects_dropped_probe=1)
+            set_instant_rst(writer.get_extra_info("socket"))
+            writer.transport.abort()
+            return
+        if not ip_acquire_slot(src_ip):
+            update_stats(connects_dropped_per_ip=1)
+            writer.transport.abort()
+            return
+        ip_slot = True
+
     acquired = False
     try:
         if active_client_sem is not None:
@@ -1888,6 +2097,8 @@ async def handle_client_wrapper(reader, writer):
     finally:
         if acquired:
             active_client_sem.release() # type: ignore
+        if ip_slot:
+            ip_release_slot(src_ip)
         writer.transport.abort()
 
 
@@ -1951,6 +2162,12 @@ async def handle_metrics(reader, writer):
                        stats["handshake_timeouts"]])
         metrics.append(["connects_dropped_overload", "counter", "dropped due to overload",
                        stats["connects_dropped_overload"]])
+        metrics.append(["connects_dropped_probe", "counter", "dropped banned probe IPs",
+                       stats["connects_dropped_probe"]])
+        metrics.append(["connects_dropped_per_ip", "counter", "dropped over per-IP limit",
+                       stats["connects_dropped_per_ip"]])
+        metrics.append(["probe_ips_banned", "counter", "number of probe IP bans",
+                       stats["probe_ips_banned"]])
         metrics.append(["upstream_connect_retries", "counter", "upstream connect retries",
                        stats["upstream_connect_retries"]])
         metrics.append(["upstream_circuit_opened", "counter", "number of breaker openings",
@@ -2121,6 +2338,8 @@ async def get_encrypted_cert(host, port, server_name):
         except asyncio.IncompleteReadError:
             return 0, b""
 
+    global mask_host_record_sizes
+
     reader, writer = await asyncio.open_connection(host, port)
     writer.write(gen_tls_client_hello_msg(server_name))
     await writer.drain()
@@ -2145,48 +2364,61 @@ async def get_encrypted_cert(host, port, server_name):
                "proxy more detectable") % config.MASK_HOST  # type: ignore
         print_err(msg)
 
+        # Feature 3: faithfully replay the real two-record app-data chunking
+        mask_host_record_sizes = [len(record3), len(record4)]
         return record4
 
+    # Feature 3: single big app-data record, mimic its exact size
+    mask_host_record_sizes = [len(record3)]
     return record3
 
 
-async def get_mask_host_cert_len():
+async def refresh_mask_host_cert(timeout=10):
+    """Fetch the MASK_HOST certificate once, update fake_cert_len and the
+    record-size pattern. Returns True on success. Used both by the periodic
+    task and by the synchronous startup prime (Feature 3)."""
     global fake_cert_len
 
-    GET_CERT_TIMEOUT = 10
+    if not config.MASK:  # type: ignore
+        return False
+
+    try:
+        task = get_encrypted_cert(config.MASK_HOST, config.MASK_PORT, config.TLS_DOMAIN)  # type: ignore
+        cert = await asyncio.wait_for(task, timeout=timeout)
+        if cert:
+            if len(cert) < MIN_CERT_LEN:
+                msg = ("The MASK_HOST %s returned several TLS records, this is not supported" %
+                       config.MASK_HOST)  # type: ignore
+                print_err(msg)
+            elif len(cert) != fake_cert_len:
+                fake_cert_len = len(cert)
+                print_err("Got cert from the MASK_HOST %s, its length is %d" %
+                          (config.MASK_HOST, fake_cert_len))  # type: ignore
+            return True
+        else:
+            print_err("The MASK_HOST %s is not TLS 1.3 host, this is not recommended" %
+                      config.MASK_HOST)  # type: ignore
+    except ConnectionRefusedError:
+        print_err("The MASK_HOST %s is refusing connections, this is not recommended" %
+                  config.MASK_HOST)  # type: ignore
+    except (TimeoutError, asyncio.TimeoutError):
+        print_err("Got timeout while getting TLS handshake from MASK_HOST %s" %
+                  config.MASK_HOST)  # type: ignore
+    except Exception as E:
+        print_err("Failed to connect to MASK_HOST %s: %s" % (
+                  config.MASK_HOST, E))  # type: ignore
+    return False
+
+
+async def get_mask_host_cert_len():
     MASK_ENABLING_CHECK_PERIOD = 60
 
     while True:
-        try:
-            if not config.MASK:  # type: ignore
-                # do nothing
-                await asyncio.sleep(MASK_ENABLING_CHECK_PERIOD)
-                continue
+        if not config.MASK:  # type: ignore
+            await asyncio.sleep(MASK_ENABLING_CHECK_PERIOD)
+            continue
 
-            task = get_encrypted_cert(config.MASK_HOST, config.MASK_PORT, config.TLS_DOMAIN)  # type: ignore
-            cert = await asyncio.wait_for(task, timeout=GET_CERT_TIMEOUT)
-            if cert:
-                if len(cert) < MIN_CERT_LEN:
-                    msg = ("The MASK_HOST %s returned several TLS records, this is not supported" %
-                           config.MASK_HOST)  # type: ignore
-                    print_err(msg)
-                elif len(cert) != fake_cert_len:
-                    fake_cert_len = len(cert)
-                    print_err("Got cert from the MASK_HOST %s, its length is %d" %
-                              (config.MASK_HOST, fake_cert_len))  # type: ignore
-            else:
-                print_err("The MASK_HOST %s is not TLS 1.3 host, this is not recommended" %
-                          config.MASK_HOST)  # type: ignore
-        except ConnectionRefusedError:
-            print_err("The MASK_HOST %s is refusing connections, this is not recommended" %
-                      config.MASK_HOST)  # type: ignore
-        except (TimeoutError, asyncio.TimeoutError):
-            print_err("Got timeout while getting TLS handshake from MASK_HOST %s" %
-                      config.MASK_HOST)  # type: ignore
-        except Exception as E:
-            print_err("Failed to connect to MASK_HOST %s: %s" % (
-                      config.MASK_HOST, E))  # type: ignore
-
+        await refresh_mask_host_cert(timeout=10)
         await asyncio.sleep(config.GET_CERT_LEN_PERIOD)  # type: ignore
 
 
@@ -2541,6 +2773,54 @@ def print_tg_info():
         print_err("Warning: one or more default settings detected")
 
 
+def run_doctor():
+    """Feature 1: startup self-check. Collects problems, prints them, and fires
+    a throttled alert email if any are found. Uses blocking sockets (startup)."""
+    CHECK_TIMEOUT = 5
+    issues = []
+
+    # MASK_HOST reachability — used both for fronting bad clients and for the
+    # TLS record-size mimicry; if it is down the proxy is far more detectable.
+    if config.MASK:  # type: ignore
+        host, port = config.MASK_HOST, config.MASK_PORT  # type: ignore
+        infos = []
+        try:
+            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        except OSError as e:
+            issues.append("MASK_HOST '%s' does not resolve: %s" % (host, e))
+        if infos:
+            af, socktype, proto, _, sa = infos[0]
+            s = socket.socket(af, socktype, proto)
+            s.settimeout(CHECK_TIMEOUT)
+            try:
+                s.connect(sa)
+            except OSError as e:
+                issues.append("MASK_HOST '%s:%s' is not reachable: %s" % (host, port, e))
+            finally:
+                s.close()
+
+    # TLS_DOMAIN is advertised in the tls links / SNI and must resolve
+    try:
+        socket.getaddrinfo(config.TLS_DOMAIN, 443, proto=socket.IPPROTO_TCP)  # type: ignore
+    except OSError as e:
+        issues.append("TLS_DOMAIN '%s' does not resolve: %s" % (config.TLS_DOMAIN, e))  # type: ignore
+
+    # email alerting prerequisites
+    if config.ALERT_EMAIL:  # type: ignore
+        if shutil.which(config.ALERT_MSMTP_PATH) is None:  # type: ignore
+            issues.append("ALERT_EMAIL is set but msmtp binary '%s' is missing" %
+                          config.ALERT_MSMTP_PATH)  # type: ignore
+
+    if issues:
+        print_err("Doctor: found %d issue(s):" % len(issues))
+        for issue in issues:
+            print_err("  - " + issue)
+        report_error("startup self-check found %d issue(s)" % len(issues),
+                     "\n".join(issues))
+    else:
+        print_err("Doctor: all startup checks passed")
+
+
 def setup_files_limit():
     try:
         import resource
@@ -2620,6 +2900,9 @@ def loop_exception_handler(loop, context):
                     transport.abort()
                     return
 
+    # genuinely unexpected loop error -> alert (throttled to once / 12h)
+    report_error("event loop exception: %s" % context.get("message", "unknown"),
+                 str(context))
     loop.default_exception_handler(context)
 
 
@@ -2698,6 +2981,9 @@ def main():
     init_ip_info()
     print_tg_info()
 
+    if config.DOCTOR_ENABLED:  # type: ignore
+        run_doctor()
+
     setup_asyncio()
     setup_files_limit()
     setup_signals()
@@ -2714,6 +3000,14 @@ def main():
 
     asyncio.set_event_loop(loop)
     loop.set_exception_handler(loop_exception_handler)
+
+    # Feature 3: fetch real MASK_HOST record sizes before serving, so the very
+    # first clients already get a faithful ServerHello (no random-length window).
+    if config.MASK and config.TLS_MIMIC_PRIME_ON_START:  # type: ignore
+        try:
+            loop.run_until_complete(refresh_mask_host_cert(timeout=10))
+        except Exception as e:
+            print_err("Startup MASK_HOST prime failed: %s" % e)
 
     utilitary_tasks = create_utilitary_tasks(loop)
     for task in utilitary_tasks:

@@ -1,5 +1,7 @@
 # Secrets / local config — never commit
 .env
+msmtprc
+.msmtprc
 
 # Python
 __pycache__/

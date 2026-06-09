@@ -51,8 +51,37 @@ FAST_MODE = True
 PREFER_IPV6 = False
 
 # Backpressure / overload protection.
-MAX_ACTIVE_CLIENTS = 500
+# Hard cap on simultaneously served clients (small personal proxy).
+MAX_ACTIVE_CLIENTS = 10
 ACCEPT_QUEUE_TIMEOUT = 1.2
+
+# --- Per-IP limiting & probe cutoff (Feature 2) ---
+# Max simultaneous TCP connections from one source IP (Telegram opens up to ~8).
+MAX_CONNS_PER_IP = 8
+# An untrusted IP that only ever sends bad/zero handshakes is treated as a probe
+# and hard-dropped (RST) for this many seconds. A valid MTProto handshake makes
+# the IP "trusted" and immune to this. So real users are never blocked; one-shot
+# scanners/probes get cut off cheaply.
+PROBE_BAN_SECS = 30 * 60
+PROBE_FAIL_THRESHOLD = 1
+IP_GREYLIST_LEN = 65536
+
+# --- Email alerting via msmtp (Feature 1) ---
+# Recipient of alert emails. Empty disables alerting. Set MTPROTO_ALERT_EMAIL in
+# .env. The Gmail app-password lives in ~/.msmtprc (NOT here), see DEPLOY.md.
+ALERT_EMAIL = os.environ.get("MTPROTO_ALERT_EMAIL", "")
+ALERT_EMAIL_FROM = os.environ.get("MTPROTO_ALERT_FROM", ALERT_EMAIL)
+# No more than one alert email per this interval (seconds). Default: 12 hours.
+ALERT_MIN_INTERVAL = 12 * 60 * 60
+ALERT_MSMTP_PATH = "msmtp"
+# Run the startup self-check ("doctor") and alert about any problems found.
+DOCTOR_ENABLED = True
+
+# --- TLS record-size mimicry (Feature 3) ---
+# Replay the MASK_HOST's real TLS app-data record sizes in our fake ServerHello,
+# and fetch them synchronously on start so the first clients are already faithful.
+TLS_MIMIC_RECORD_SIZES = True
+TLS_MIMIC_PRIME_ON_START = True
 
 # Buffers tuned for 1GB RAM (higher throughput, still bounded).
 TO_CLT_BUFSIZE = (16384, 120, 131072)
