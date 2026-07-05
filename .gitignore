@@ -3,6 +3,12 @@
 msmtprc
 .msmtprc
 
+# Personal server runbook (real IPs/secrets) — keep local, not in repo
+MTG-VDS-SETUP.md
+
+# OS / editor
+.DS_Store
+
 # Python
 __pycache__/
 *.py[cod]
