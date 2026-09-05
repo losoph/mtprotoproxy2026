@@ -1,15 +1,43 @@
 # mtprotoproxy2026
 
 Ready-to-deploy **MTProto proxy for a single VPS** — a curated, current
-set of settings and one bootstrap script, tuned for the 2026 Russian DPI
-(TSPU) reality. Not a code fork: it packages the tested, maintained proxy
-(`9seconds/mtg`, fake-TLS) plus a lean hardening baseline that survives
-re-installs and reboots.
+set of settings and bootstrap scripts, tuned for the 2026 Russian DPI
+(TSPU) reality. Not a code fork: it packages a tested, maintained proxy
+(fake-TLS) plus a lean hardening baseline that survives re-installs and
+reboots.
 
 > Scope: a clean MTProto node. No tunnels, no gateways, no host-specific glue.
 > Bring it up on any fresh Ubuntu VPS in one command.
 
-## Quick start
+## Quick start (current: telemt)
+
+**telemt** (Rust/Tokio, [telemt/telemt](https://github.com/telemt/telemt)) is
+what actually runs in production now. It was deployed and tuned by hand on
+the server first (see git history); `setup-telemt-node.sh` reproduces that
+deployment from a GitHub release so the next box doesn't need manual setup.
+
+```bash
+# on a clean Ubuntu 22.04/24.04 VPS, as root:
+sudo DOMAIN=vkvideo.ru PORT=443 USERNAME=proxy bash setup-telemt-node.sh
+```
+
+The script downloads a pinned, checksum-verified telemt release, writes
+`/etc/telemt/config.toml` (fake-TLS + real front-cert emulation via
+`tls_emulation`) and a hardened systemd unit (`CAP_NET_BIND_SERVICE` only,
+`ProtectSystem=strict`), then enables the service. See
+[`telemt/config.reference.toml`](telemt/config.reference.toml) for the full
+annotated option list — e.g. multiple users, `use_middle_proxy`, metrics.
+Re-runnable; pass `NEW_SECRET=1` to rotate the secret, `TELEMT_VERSION=x.y.z`
+to pin a different release.
+
+> Unlike `mtg` below, telemt's `tls_domain` is a plain config field, not
+> embedded in the user secret — rotating the domain doesn't rotate secrets.
+
+## Alternative: mtg (Docker)
+
+An earlier setup based on [`9seconds/mtg`](https://github.com/9seconds/mtg) in
+Docker. Still valid, no longer the default — kept as a documented fallback,
+e.g. if you'd rather not run a bare binary as root, or want Docker isolation.
 
 ```bash
 # on a clean Ubuntu 22.04/24.04 VPS, as root:
@@ -39,7 +67,9 @@ updated clients survive.
 
 ## Choosing the fronting domain (SNI)
 
-The secret embeds a domain the handshake impersonates. It must:
+Applies to both proxies — for `mtg` the domain is embedded in the secret
+itself, for telemt it's the separate `tls_domain` config field (see note
+above). Either way, the domain must:
 
 1. **Support TLS 1.3** — so the fake-TLS (always 1.3-shaped) is consistent with
    the real domain. Verify from an unblocked host (system `openssl` can lie):
@@ -68,6 +98,17 @@ Verified good (TLS 1.3 + 1.2): `avito.ru`, `ya.ru`, `vk.com`, `ozon.ru`,
 
 ## Manage
 
+telemt:
+
+```bash
+journalctl -u telemt -f            # logs (journald handles rotation)
+systemctl restart telemt           # restart (survives reboot: enabled)
+# rotate secret:
+sudo NEW_SECRET=1 DOMAIN=vkvideo.ru PORT=443 bash setup-telemt-node.sh
+```
+
+mtg:
+
 ```bash
 docker logs -f mtproto-proxy      # logs
 docker restart mtproto-proxy      # restart (survives reboot: unless-stopped)
@@ -75,9 +116,9 @@ docker restart mtproto-proxy      # restart (survives reboot: unless-stopped)
 sudo NEW_SECRET=1 DOMAIN=ya.ru PORT=8443 bash setup-mtg-node.sh
 ```
 
-## `python-proxy/` — alternative pure-Python implementation
+## `python-proxy/` — legacy pure-Python implementation
 
-An earlier Python MTProto proxy (fork lineage of alexbers/mtprotoproxy) lives
+The original Python MTProto proxy (fork lineage of alexbers/mtprotoproxy) lives
 in [`python-proxy/`](python-proxy/). It works, but its fake-TLS ServerHello is
-**not validated against the April-2026 fingerprint detection** — use the `mtg`
-setup above for production. Kept for reference and no-Docker / multi-user cases.
+**not validated against the April-2026 fingerprint detection** — use telemt or
+`mtg` above for production. Kept for reference and no-Docker / multi-user cases.
