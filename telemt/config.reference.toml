@@ -37,6 +37,16 @@ port = 443
 # metrics_listen = "127.0.0.1:9090" # Listen address for metrics (overrides metrics_port)
 # metrics_whitelist = ["127.0.0.1/32", "::1/128"]
 
+# client_mss / client_mss_bulk (added upstream mid-2026, PR telemt/telemt#847,
+# not yet in the dump this file was pulled from): fragments only the FakeTLS
+# ServerHello to a low MSS, then restores a normal MSS for the rest of the
+# connection — evades Russian mobile-carrier (TSPU) ServerHello-size drops
+# without the packet-rate cost of clamping the whole connection. setup-telemt-node.sh
+# sets these by default (CLIENT_MSS=tspu, CLIENT_MSS_BULK=1400); see
+# https://github.com/telemt/telemt/blob/main/docs/Config_params/CONFIG_PARAMS.en.md#client_mss
+# client_mss = "tspu"
+# client_mss_bulk = "1400"
+
 [server.api]
 enabled = true
 listen = "127.0.0.1:9091"

@@ -23,6 +23,15 @@ DOMAIN="${DOMAIN:-vkvideo.ru}"        # fronting SNI — must serve real TLS 1.3
 PORT="${PORT:-443}"
 USERNAME="${USERNAME:-proxy}"         # access.users key; multiple users = re-run
                                        # with a different USERNAME, or edit config.toml
+# TSPU (Russian mobile-carrier DPI, MegaFon/MTS) drops the FakeTLS ServerHello
+# by size/signature. client_mss="tspu" (MSS 92) fragments just the ServerHello
+# across ~3 TCP segments so it slips past that check; client_mss_bulk restores
+# a normal MSS right after the handshake so it doesn't tax bulk throughput.
+# 1400 (not 1460) also leaves headroom for a client on a VPN/tunnel, which eats
+# some MTU — keeps the connection from stalling instead of just black-holing.
+# Empty string disables (matches telemt's own default: unset = off).
+CLIENT_MSS="${CLIENT_MSS:-tspu}"
+CLIENT_MSS_BULK="${CLIENT_MSS_BULK:-1400}"
 # Pin deliberately; bump after checking https://github.com/telemt/telemt/releases
 TELEMT_VERSION="${TELEMT_VERSION:-3.5.5}"
 NEW_SECRET="${NEW_SECRET:-0}"
@@ -76,6 +85,18 @@ show = "*"
 
 [server]
 port = $PORT
+EOF
+if [ -n "$CLIENT_MSS" ]; then
+  cat >> /etc/telemt/config.toml <<EOF
+client_mss = "$CLIENT_MSS"
+EOF
+  if [ -n "$CLIENT_MSS_BULK" ]; then
+    cat >> /etc/telemt/config.toml <<EOF
+client_mss_bulk = "$CLIENT_MSS_BULK"
+EOF
+  fi
+fi
+cat >> /etc/telemt/config.toml <<EOF
 
 [server.api]
 enabled = true
