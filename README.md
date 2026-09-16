@@ -33,6 +33,69 @@ to pin a different release.
 > Unlike `mtg` below, telemt's `tls_domain` is a plain config field, not
 > embedded in the user secret — rotating the domain doesn't rotate secrets.
 
+## WEB proxy (`tg://webproxy`) — for a box that already serves a website
+
+Fake-TLS is the thing TSPU now fingerprints. Telegram's answer is a second
+proxy type, **WEB** ([PoC: `telegramdesktop/tproxy-server`](https://github.com/telegramdesktop/tproxy-server)):
+the app keeps normal MTProxy framing and encryption but carries it inside
+ordinary HTTPS / WebSocket requests to a real hostname on port 443. On the wire
+it is a website, so there is no MTProto handshake to fingerprint — what is
+exposed instead is the hostname and its behaviour under probing.
+
+`tproxy-server` wants Caddy to own ports 80/443, which collides with an existing
+web server. **telemt >= 3.5.6 implements the same protocol** as
+`transport = "web"` and deliberately does *not* terminate TLS: the existing
+nginx keeps 443 and reverse-proxies one dedicated vhost to telemt on loopback.
+That is the variant this repo ships.
+
+```bash
+# on the box that already runs a site (e.g. tldw), as root:
+sudo WEB_HOST=cdn.example.com \
+     DECOY_UPSTREAM=http://127.0.0.1:8080 \
+     EMAIL=admin@example.com \
+     bash setup-telemt-web-node.sh
+```
+
+The script installs telemt (pinned 3.5.7), writes a config with **both**
+transports — the existing fake-TLS listener (secret reused, moved off 443 to
+8443 since nginx has 443) and the new WEB listener on `127.0.0.1:18080` — adds
+the nginx vhost, gets a Let's Encrypt certificate, verifies through the control
+API that the binary really has WEB, and prints the link:
+
+```text
+https://t.me/webproxy?server=cdn.example.com&secret=dd<32 hex>
+```
+
+See [`telemt/config.web.reference.toml`](telemt/config.web.reference.toml) for
+the annotated config and
+[`telemt/nginx-telemt-web.conf.example`](telemt/nginx-telemt-web.conf.example)
+for the vhost.
+
+Rules that are easy to get wrong:
+
+- **A dedicated hostname, not a path.** The *entire* vhost is forwarded to
+  telemt. Splitting only the carrier paths at nginx would make authenticated and
+  ordinary traffic observably different and would bypass telemt's decoy policy.
+  Keep the real site on its own hostname.
+- **The decoy is the anti-probing contract.** Everything that is not an
+  authenticated carrier request must get a plausible site back — point
+  `DECOY_UPSTREAM` at the local origin of a site you actually serve, and check
+  `/` and a 404 through the public endpoint before handing the link out.
+- **No `ee` secrets.** WEB uses `dd` or `plain` 16-byte secrets; the fake-TLS
+  `ee` form is not accepted. It is a separate secret from the MTProto one.
+- **Client support decides the carrier.** Desktop builds with the WEB proxy type
+  negotiate WebSocket/lane carriers; current iOS speaks only plain `https`, so
+  `carrier = "https"` stays the fallback. Android is still PoC-grade.
+- **Timeouts.** nginx `proxy_read/send_timeout` must exceed the 25 s long poll
+  (65 s in the shipped vhost), `proxy_buffering off`, `proxy_next_upstream off`,
+  and `X-Forwarded-For` must be overwritten, not appended.
+- **Don't log.** `access_log off` on that vhost: raw queries carry bridge
+  capabilities, `Authorization` carries bearer credentials.
+
+Running both types side by side is the sane test setup: the fake-TLS link keeps
+working for clients that still get through, the WEB link is what you hand to
+users whose carrier kills fake-TLS.
+
 ## Alternative: mtg (Docker)
 
 An earlier setup based on [`9seconds/mtg`](https://github.com/9seconds/mtg) in
@@ -105,6 +168,19 @@ journalctl -u telemt -f            # logs (journald handles rotation)
 systemctl restart telemt           # restart (survives reboot: enabled)
 # rotate secret:
 sudo NEW_SECRET=1 DOMAIN=vkvideo.ru PORT=443 bash setup-telemt-node.sh
+```
+
+telemt WEB side:
+
+```bash
+# runtime status (sessions, capacity, carrier negotiation outcomes)
+curl -sS -H "Authorization: Bearer $(cat /var/lib/telemt/api-token)" \
+  http://127.0.0.1:9091/v1/runtime/web/status
+# live sessions / close them
+curl -sS -H "Authorization: Bearer $(cat /var/lib/telemt/api-token)" \
+  http://127.0.0.1:9091/v1/runtime/web/sessions
+# rotate the WEB secret (then re-issue links):
+sudo NEW_SECRET=1 WEB_HOST=cdn.example.com bash setup-telemt-web-node.sh
 ```
 
 mtg:

@@ -1,0 +1,101 @@
+### Annotated WEB-mode reference — what setup-telemt-web-node.sh generates.
+### Documentation only; the script builds the real /etc/telemt/config.toml from
+### env vars (WEB_HOST/DECOY_UPSTREAM/...). Authoritative upstream guide:
+### https://github.com/telemt/telemt/blob/main/docs/WEB/WEB_PROXY.en.md
+###
+### WEB mode carries ordinary MTProxy streams inside plain HTTPS/WebSocket on
+### port 443, compatible with Telegram Desktop's "WEB" proxy type
+### (tg://webproxy?server=...&secret=...). telemt never terminates TLS here:
+### nginx owns the certificate and forwards plain HTTP/1.1 to a loopback
+### listener, which is exactly why this fits a box that already serves a site.
+### Requires telemt >= 3.5.6 (WEB + runtime lifecycle controls).
+
+[general]
+use_middle_proxy = false
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure  = false
+tls     = true                      # fake-TLS MTProto listener below
+
+[general.links]
+show = "*"                          # telemt prints ee-links and webproxy links
+
+[server]
+port = 8443                         # fake-TLS MTProto — NOT 443, nginx has that
+client_mss = "tspu"                 # TSPU ServerHello fragmentation (MTProto only)
+client_mss_bulk = "1400"
+
+[server.api]
+enabled = true
+listen = "127.0.0.1:9091"
+whitelist = ["127.0.0.1/32", "::1/128"]
+auth_header = "Bearer replace-with-a-random-control-token"
+read_only = false                   # needed for /v1/runtime/web/* controls
+
+# --- classic fake-TLS listener (unchanged, all clients) ----------------------
+[[server.listeners]]
+ip = "0.0.0.0"                      # inherits server.port
+
+# --- WEB listener: plain HTTP/1.1, nginx only, never exposed to the internet --
+[[server.listeners]]
+ip = "127.0.0.1"
+port = 18080
+transport = "web"
+proxy_protocol = false              # required: false on a WEB listener
+web_client_ip_source = "x_forwarded_for"
+web_trusted_proxy_cidrs = ["127.0.0.1/32"]   # only the local nginx; /0 rejected
+
+[web]
+enabled = true
+# `carrier` is the fixed fallback and the only mode for clients that send no
+# negotiation metadata — current Telegram iOS is one of those and supports only
+# "https", so leave this at "https" if iOS clients may use the link.
+carrier = "https"
+# Negotiated in order for capable clients (Desktop); `carrier` is appended last.
+carriers = ["websocket-lanes", "websocket", "https-lanes"]
+carrier_learning = true
+# On saturation answer a bounded 503 instead of dropping the socket — a silent
+# drop is more distinguishable from an ordinary web server than a 503 is.
+http_connection_capacity_action = "respond"
+
+[[web.vhosts]]
+host = "proxy.example.com"          # dedicated FQDN; the WHOLE vhost is telemt's
+public_addr = "203.0.113.10:443"    # the concrete public IP:443 clients reach;
+                                    # it is part of the inner relay tuple
+
+# The decoy is the anti-probing contract: anything that is not an authenticated
+# carrier request (scanner, ISP, browser) gets an ordinary site back. Point it
+# at the local origin of the site this box already serves...
+[web.vhosts.decoy]
+mode = "http_upstream"
+upstream = "http://127.0.0.1:8080"  # loopback/private IP literal only
+# ...or serve an immutable static snapshot instead:
+# mode = "static_directory"
+# directory = "/var/lib/telemt/public"
+# index = "index.html"
+
+[[web.vhosts.profiles]]
+user = "webproxy"                   # key from [access.users]
+secret_mode = "dd"                  # "dd" or "plain" — "ee" (fake-TLS) is not
+                                    # supported by WEB mode
+# max_sessions = 8
+# max_streams = 512
+# max_streams_per_session = 64
+
+# Bounded server-side request/frame recorder, rendered at the API listener's
+# /web-status. Off by default; useful while testing a new node.
+# [web.debug]
+# enabled = true
+# body_capture = "metadata"
+
+[censorship]
+tls_domain = "vkvideo.ru"           # fake-TLS side only; irrelevant to WEB
+mask = true
+tls_emulation = true
+tls_front_dir = "/var/lib/telemt/tlsfront"
+
+[access.users]
+webproxy = "00000000000000000000000000000000"   # WEB secret (dd/plain link)
+proxy    = "11111111111111111111111111111111"   # fake-TLS secret (ee link)
