@@ -327,13 +327,31 @@ sleep 2
 systemctl is-active --quiet telemt || { journalctl -u telemt -n 30 --no-pager; die "telemt failed to start"; }
 
 # ---- verify the binary really has WEB --------------------------------------------
-# Release notes are not a guarantee: ask the running process.
+# Release notes are not a guarantee: ask the running process. It answers only
+# after STUN and the DC connectivity sweep, which takes ~7s on a good day and
+# much longer while the path to the DCs is flapping — so poll, and tell "not
+# listening yet" apart from "this endpoint does not exist".
 log "WEB runtime check"
-if ! curl -fsS --max-time 5 -H "Authorization: Bearer $API_TOKEN" \
-      http://127.0.0.1:9091/v1/runtime/web/status >/dev/null; then
-  journalctl -u telemt -n 30 --no-pager
-  die "this telemt build has no /v1/runtime/web/status — WEB support is missing; pin a newer TELEMT_VERSION"
-fi
+web_status_code(){
+  curl -s -o /dev/null --max-time 5 -w '%{http_code}' \
+    -H "Authorization: Bearer $API_TOKEN" \
+    http://127.0.0.1:9091/v1/runtime/web/status 2>/dev/null || echo 000
+}
+WEB_OK=0
+for _ in $(seq 1 45); do        # up to ~90s
+  CODE="$(web_status_code)"
+  case "$CODE" in
+    200) WEB_OK=1; break ;;
+    404|501)
+      journalctl -u telemt -n 30 --no-pager
+      die "telemt answers but has no /v1/runtime/web/status (HTTP $CODE) — this build lacks WEB; pin a newer TELEMT_VERSION" ;;
+    401|403)
+      die "the control API rejected the token (HTTP $CODE) — check [server.api].auth_header in /etc/telemt/config.toml" ;;
+  esac
+  systemctl is-active --quiet telemt || { journalctl -u telemt -n 30 --no-pager; die "telemt stopped while starting up"; }
+  sleep 2
+done
+[ "$WEB_OK" = 1 ] || { journalctl -u telemt -n 30 --no-pager; die "the control API never became ready (last HTTP $CODE)"; }
 
 # ---- upstream probe ----------------------------------------------------------------
 # Episodic upstream failures (telemt: "Connection timeout to <DC>:443", then
