@@ -90,8 +90,11 @@ carries both prefix sets. That ends the eviction loop without losing UDP speed.
 Still open, for the next session:
 
 - The Telegram prefix routes were moved with `ip route replace … dev tun11`, which
-  does **not** survive a reboot. Find the script that lays them (the configs use
-  `route-nopull`, so something external does) and pin them to `tun11` there.
+  does **not** survive a reboot: on boot `/etc/openvpn/client/tldw-routes-up.sh`
+  lays them again from `telegram-routes.list` (and `youtube-routes.list`), still
+  aimed at the now-disabled `tldw-main`/`tun10`, and the proxy stops. Point that
+  script's Telegram list at the surviving tunnel before the next reboot. Verified
+  after the change: 0 reconnects in 10 minutes, where it used to be 3.
 - `tun-mtu 1400` + `mssfix 1360` in `tldw-media.conf`: MTU 1500 inside the tunnel
   guarantees fragmentation on every large packet.
 - If two simultaneous tunnels are ever wanted again, the provider has siblings —
