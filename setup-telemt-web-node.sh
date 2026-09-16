@@ -42,6 +42,11 @@ SITE_HOST="${SITE_HOST:-}"            # optional: hostname of the site this box
                                       # terminates TLS for it — handy when the
                                       # app used to sit on port 80 with no HTTPS.
 SITE_UPSTREAM="${SITE_UPSTREAM:-}"    # its local origin, e.g. http://127.0.0.1:8080
+SITE_MAX_BODY="${SITE_MAX_BODY:-512m}"  # nginx defaults to 1m, which silently breaks
+                                        # an app that accepts uploads (audio, video,
+                                        # images). 0 disables the limit entirely.
+SITE_TIMEOUT="${SITE_TIMEOUT:-300s}"    # slow requests (transcoding, transcription)
+                                        # must not be cut at nginx's 60s default
 WEB_USERNAME="${WEB_USERNAME:-webproxy}"
 WEB_LISTEN_PORT="${WEB_LISTEN_PORT:-18080}"   # private plain-HTTP listener
 WEB_CARRIER="${WEB_CARRIER:-https}"           # final fallback; iOS supports only this
@@ -419,6 +424,8 @@ $(nginx_http2_lines)
     ssl_certificate     $CERT_DIR/fullchain.pem;
     ssl_certificate_key $CERT_DIR/privkey.pem;
 
+    client_max_body_size $SITE_MAX_BODY;
+
     location / {
         proxy_pass $SITE_UPSTREAM;
         proxy_http_version 1.1;
@@ -428,6 +435,11 @@ $(nginx_http2_lines)
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$telemt_connection_upgrade;
+
+        proxy_read_timeout $SITE_TIMEOUT;
+        proxy_send_timeout $SITE_TIMEOUT;
+        proxy_request_buffering off;   # stream uploads through instead of
+                                       # spooling the whole body to disk first
     }
 }
 EOF
