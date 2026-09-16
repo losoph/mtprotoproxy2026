@@ -382,7 +382,9 @@ upstream telemt_web {
 server {
     listen 80;
     listen [::]:80;
-    server_name $WEB_HOST;
+    # Both names, or the site's plain-HTTP visitors land on nginx's default vhost
+    # instead of a redirect — and its ACME renewal stops being served from here.
+    server_name $WEB_HOST${SITE_HOST:+ $SITE_HOST};
     location /.well-known/acme-challenge/ { root /var/www/html; }
     location / { return 301 https://\$host\$request_uri; }
 }
