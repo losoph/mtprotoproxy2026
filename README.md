@@ -71,6 +71,27 @@ script refuses early (naming the holder) if they are not:
   nginx's 1m body limit and 60s proxy timeout silently break an app that takes
   uploads or answers slowly.
 
+### Deploys, not hand edits
+
+`setup-telemt-web-node.sh` records its invocation in `/etc/telemt/deploy.env`,
+and [`deploy.sh`](deploy.sh) replays it against a newer checkout:
+
+```bash
+sudo bash deploy.sh --install   # systemd timer, every 5 min (once)
+sudo bash deploy.sh --status    # what is deployed vs. what origin has
+sudo bash deploy.sh --force     # apply now, new commit or not
+journalctl -u telemt-deploy -f
+```
+
+A deploy only runs when the branch head moved (the timer is otherwise silent),
+takes one deploy at a time via flock, and never rotates secrets — `NEW_SECRET`
+is not inherited. It does restart telemt and reload nginx, so live WEB sessions
+reconnect.
+
+Editing `/etc/nginx/*` or `/etc/telemt/*` on the node is not a shortcut: the
+next deploy overwrites it, and in between the box is in a state no commit
+describes. Fix it in the repo, push, deploy.
+
 > Keeping fake-TLS on the public 443 via SNI routing (nginx `stream` +
 > `ssl_preread`) looks tempting but breaks `client_mss`: the ServerHello
 > fragmentation that gets past TSPU needs telemt's own socket to the client,

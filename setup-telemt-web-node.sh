@@ -503,6 +503,35 @@ echo "  GET https://$WEB_HOST/            -> $CODE"
 CODE404="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$WEB_HOST/no-such-path" || echo 000)"
 echo "  GET https://$WEB_HOST/no-such-path -> $CODE404 (must look like an ordinary site, not an error page from telemt)"
 
+# ---- record this invocation for deploy.sh ------------------------------------------
+# A deploy replays exactly these values against a newer checkout, so the node's
+# configuration follows git instead of hand edits. NEW_SECRET is deliberately not
+# recorded: a deploy must never rotate secrets behind your back.
+cat > /etc/telemt/deploy.env <<EOF
+WEB_HOST=$WEB_HOST
+PUBLIC_IP=$PUBLIC_IP
+WEB_USERNAME=$WEB_USERNAME
+WEB_LISTEN_PORT=$WEB_LISTEN_PORT
+WEB_CARRIER=$WEB_CARRIER
+WEB_CARRIERS=$WEB_CARRIERS
+SECRET_MODE=$SECRET_MODE
+SITE_HOST=$SITE_HOST
+SITE_UPSTREAM=$SITE_UPSTREAM
+SITE_MAX_BODY=$SITE_MAX_BODY
+SITE_TIMEOUT=$SITE_TIMEOUT
+DECOY_UPSTREAM=$DECOY_UPSTREAM
+KEEP_MTPROTO=$KEEP_MTPROTO
+DOMAIN=$DOMAIN
+PORT=$PORT
+USERNAME=$USERNAME
+CLIENT_MSS=$CLIENT_MSS
+CLIENT_MSS_BULK=$CLIENT_MSS_BULK
+TELEMT_VERSION=$TELEMT_VERSION
+EMAIL=$EMAIL
+CERTBOT=$CERTBOT
+EOF
+chmod 600 /etc/telemt/deploy.env
+
 # ---- summary -----------------------------------------------------------------------
 if [ "$SECRET_MODE" = dd ]; then LINK_SECRET="dd$WEB_SECRET"; else LINK_SECRET="$WEB_SECRET"; fi
 log "DONE"
@@ -527,6 +556,9 @@ Notes:
   * $WEB_HOST must serve ONLY this proxy vhost. Keep the real site on its own
     hostname; the decoy is what casual visitors of $WEB_HOST see.${SITE_HOST:+
   * $SITE_HOST is served over HTTPS from $SITE_UPSTREAM by the same nginx.}
+  * Configuration follows git: commit a change, push, and the node applies it
+    (bash deploy.sh --install once, then journalctl -u telemt-deploy -f).
+    Editing /etc/nginx or /etc/telemt by hand is overwritten by the next deploy.
   * Full upstream guide:
     https://github.com/telemt/telemt/blob/main/docs/WEB/WEB_PROXY.en.md
 EOF
