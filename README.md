@@ -90,6 +90,21 @@ Read a bad cycle by which side failed: DCs only → filtering of Telegram ranges
 neither, with a high `load=` → the box starved the probe itself. An hourly
 summary line gives the rate.
 
+[`tools/probe-report.sh`](tools/probe-report.sh) turns that log into one mail
+through msmtp — probe counts split by which side failed, telemt's own upstream
+warnings per DC address, the same-path evidence from any Telegram bots on the
+host, a live retransmit-rate sample, and a reading of what the split means:
+
+```bash
+telemt-probe-report.sh --to you@example.com --dry-run            # print it
+telemt-probe-report.sh --to you@example.com                      # send now
+sudo telemt-probe-report.sh --to you@example.com \
+     --schedule '2026-09-17 21:00'                               # one-shot timer
+```
+
+The scheduled timer uses the system timezone, survives a reboot (`Persistent`),
+fires late rather than never, and retires itself once it has run.
+
 ### Deploys, not hand edits
 
 `setup-telemt-web-node.sh` records its invocation in `/etc/telemt/deploy.env`,

@@ -346,6 +346,10 @@ if [ "$UPSTREAM_PROBE" = 1 ] && [ -f "$SELF_DIR/tools/upstream-probe.sh" ]; then
   # Install it out of the repo: the unit runs with ProtectHome=true, so a script
   # under /root (the usual place for a deploy checkout) is invisible to it.
   install -m 755 "$SELF_DIR/tools/upstream-probe.sh" "$PROBE_BIN"
+  # The report reader lives next to it, so a scheduled unit never points into
+  # the repo checkout (which may move, and is unreadable under ProtectHome).
+  [ -f "$SELF_DIR/tools/probe-report.sh" ] &&
+    install -m 755 "$SELF_DIR/tools/probe-report.sh" /usr/local/bin/telemt-probe-report.sh
   cat > /etc/systemd/system/telemt-upstream-probe.service <<EOF
 [Unit]
 Description=Probe the node's path to the Telegram DCs (records episodic loss)
@@ -372,7 +376,8 @@ EOF
 elif [ -f /etc/systemd/system/telemt-upstream-probe.service ]; then
   log "removing upstream probe (UPSTREAM_PROBE=$UPSTREAM_PROBE)"
   systemctl disable --now telemt-upstream-probe.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/telemt-upstream-probe.service "$PROBE_BIN"
+  rm -f /etc/systemd/system/telemt-upstream-probe.service "$PROBE_BIN" \
+        /usr/local/bin/telemt-probe-report.sh
   systemctl daemon-reload
 fi
 
@@ -604,6 +609,8 @@ Notes:
   * $SITE_HOST is served over HTTPS from $SITE_UPSTREAM by the same nginx.}
   * Upstream path to the Telegram DCs is probed continuously; only bad cycles
     are logged: journalctl -u telemt-upstream-probe --since today
+  * Mail a report of it (msmtp): telemt-probe-report.sh --to you@example.com
+    (--dry-run prints it; --schedule '2026-09-17 21:00' arms a one-shot timer)
   * Configuration follows git: commit a change, push, and the node applies it
     (bash deploy.sh --install once, then journalctl -u telemt-deploy -f).
     Editing /etc/nginx or /etc/telemt by hand is overwritten by the next deploy.
