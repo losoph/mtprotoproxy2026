@@ -71,6 +71,25 @@ script refuses early (naming the holder) if they are not:
   nginx's 1m body limit and 60s proxy timeout silently break an app that takes
   uploads or answers slowly.
 
+### Watching the path to Telegram
+
+A proxy can be perfectly configured and still stall: the node's own egress to the
+Telegram DCs drops for a few minutes at a time (telemt logs `Connection timeout
+to <DC>:443`, then `No healthy upstreams available`), and by the time you test by
+hand it is fine again. `UPSTREAM_PROBE=1` (the default) runs
+[`tools/upstream-probe.sh`](tools/upstream-probe.sh) as `telemt-upstream-probe`,
+which dials three DC addresses and two neutral controls every 30s and logs only
+the bad cycles:
+
+```bash
+journalctl -u telemt-upstream-probe --since today
+```
+
+Read a bad cycle by which side failed: DCs only → filtering of Telegram ranges
+(`use_middle_proxy` is worth trying); DCs *and* controls → the link or the host;
+neither, with a high `load=` → the box starved the probe itself. An hourly
+summary line gives the rate.
+
 ### Deploys, not hand edits
 
 `setup-telemt-web-node.sh` records its invocation in `/etc/telemt/deploy.env`,

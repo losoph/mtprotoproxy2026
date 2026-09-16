@@ -63,6 +63,10 @@ USERNAME="${USERNAME:-proxy}"
 CLIENT_MSS="${CLIENT_MSS:-tspu}"
 CLIENT_MSS_BULK="${CLIENT_MSS_BULK:-1400}"
 
+UPSTREAM_PROBE="${UPSTREAM_PROBE:-1}"   # continuous probe of the node's path to
+                                        # the Telegram DCs; 0 removes it. It logs
+                                        # only bad cycles, so the journal stays quiet.
+
 # WEB needs the fixes/lifecycle controls of the 3.5.6+ line.
 TELEMT_VERSION="${TELEMT_VERSION:-3.5.7}"
 NEW_SECRET="${NEW_SECRET:-0}"
@@ -331,6 +335,43 @@ if ! curl -fsS --max-time 5 -H "Authorization: Bearer $API_TOKEN" \
   die "this telemt build has no /v1/runtime/web/status — WEB support is missing; pin a newer TELEMT_VERSION"
 fi
 
+# ---- upstream probe ----------------------------------------------------------------
+# Episodic upstream failures (telemt: "Connection timeout to <DC>:443", then
+# "No healthy upstreams available") look like a broken proxy to users while every
+# manual check passes. Keep a continuous record so the cause is decidable later.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ "$UPSTREAM_PROBE" = 1 ] && [ -f "$SELF_DIR/tools/upstream-probe.sh" ]; then
+  log "upstream probe"
+  cat > /etc/systemd/system/telemt-upstream-probe.service <<EOF
+[Unit]
+Description=Probe the node's path to the Telegram DCs (records episodic loss)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash $SELF_DIR/tools/upstream-probe.sh
+Restart=always
+RestartSec=10
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable telemt-upstream-probe.service >/dev/null
+  systemctl restart telemt-upstream-probe.service
+elif [ -f /etc/systemd/system/telemt-upstream-probe.service ]; then
+  log "removing upstream probe (UPSTREAM_PROBE=$UPSTREAM_PROBE)"
+  systemctl disable --now telemt-upstream-probe.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/telemt-upstream-probe.service
+  systemctl daemon-reload
+fi
+
 # ---- nginx ------------------------------------------------------------------------
 if ! command -v nginx >/dev/null; then
   log "installing nginx (WEB mode needs an external TLS terminator)"
@@ -527,6 +568,7 @@ USERNAME=$USERNAME
 CLIENT_MSS=$CLIENT_MSS
 CLIENT_MSS_BULK=$CLIENT_MSS_BULK
 TELEMT_VERSION=$TELEMT_VERSION
+UPSTREAM_PROBE=$UPSTREAM_PROBE
 EMAIL=$EMAIL
 CERTBOT=$CERTBOT
 EOF
@@ -556,6 +598,8 @@ Notes:
   * $WEB_HOST must serve ONLY this proxy vhost. Keep the real site on its own
     hostname; the decoy is what casual visitors of $WEB_HOST see.${SITE_HOST:+
   * $SITE_HOST is served over HTTPS from $SITE_UPSTREAM by the same nginx.}
+  * Upstream path to the Telegram DCs is probed continuously; only bad cycles
+    are logged: journalctl -u telemt-upstream-probe --since today
   * Configuration follows git: commit a change, push, and the node applies it
     (bash deploy.sh --install once, then journalctl -u telemt-deploy -f).
     Editing /etc/nginx or /etc/telemt by hand is overwritten by the next deploy.
