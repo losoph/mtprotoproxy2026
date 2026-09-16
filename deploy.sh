@@ -16,6 +16,7 @@
 #   sudo bash deploy.sh               # apply now if origin has a new commit
 #   sudo bash deploy.sh --force       # apply even without a new commit
 #   sudo bash deploy.sh --status      # what is deployed, what is pending
+#   sudo bash deploy.sh --set USE_MIDDLE_PROXY=1   # change a node parameter + apply
 #   journalctl -u telemt-deploy -f    # what the timer did
 # =============================================================================
 set -euo pipefail
@@ -94,8 +95,40 @@ apply(){
   log "deployed $target"
 }
 
+# ---- --set: change a node parameter without hand-editing files ----------------
+# deploy.env is the node's parameters, not generated config, so changing it is
+# legitimate — but a sed that silently matches nothing is how ME mode appeared
+# to be enabled while telemt kept using Direct DC.
+set_params(){
+  [ -f "$ENV_FILE" ] || die "$ENV_FILE is missing — run setup-telemt-web-node.sh once first"
+  local pair key value old
+  for pair in "$@"; do
+    case "$pair" in
+      *=*) key="${pair%%=*}"; value="${pair#*=}" ;;
+      *) die "expected KEY=VALUE, got: $pair" ;;
+    esac
+    if grep -q "^$key=" "$ENV_FILE"; then
+      old="$(sed -n "s|^$key=||p" "$ENV_FILE" | head -1)"
+      sed -i "s|^$key=.*|$key=$value|" "$ENV_FILE"
+      log "$key: '${old}' -> '$value'"
+    else
+      printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+      log "$key: (unset) -> '$value'"
+    fi
+  done
+}
+
 case "${1:-}" in
   --install) install_timer; exit 0 ;;
+  --set)
+    shift
+    [ $# -gt 0 ] || die "--set needs at least one KEY=VALUE"
+    set_params "$@"
+    # Apply right away: a parameter that is stored but not applied is a lie.
+    fetch_origin || log "WARNING: fetch failed, applying the current checkout"
+    TARGET="$(git -C "$REPO_DIR" rev-parse "origin/$BRANCH" 2>/dev/null || git -C "$REPO_DIR" rev-parse HEAD)"
+    apply "$TARGET"
+    exit 0 ;;
   --status)
     fetch_origin || log "WARNING: fetch failed, comparing against the last known origin"
     TARGET="$(git -C "$REPO_DIR" rev-parse "origin/$BRANCH")"
@@ -105,7 +138,7 @@ case "${1:-}" in
     systemctl --no-pager list-timers telemt-deploy.timer 2>/dev/null | head -3
     exit 0 ;;
   --force|"") ;;
-  *) die "unknown argument: $1 (use --install, --force, --status, or none)" ;;
+  *) die "unknown argument: $1 (use --install, --set K=V, --force, --status, or none)" ;;
 esac
 
 [ -f "$ENV_FILE" ] || die "$ENV_FILE is missing — run setup-telemt-web-node.sh once first"

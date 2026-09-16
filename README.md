@@ -114,8 +114,14 @@ and [`deploy.sh`](deploy.sh) replays it against a newer checkout:
 sudo bash deploy.sh --install   # systemd timer, every 5 min (once)
 sudo bash deploy.sh --status    # what is deployed vs. what origin has
 sudo bash deploy.sh --force     # apply now, new commit or not
+sudo bash deploy.sh --set USE_MIDDLE_PROXY=1   # change a node parameter and apply
 journalctl -u telemt-deploy -f
 ```
+
+`--set` edits `/etc/telemt/deploy.env` (the node's parameters, not generated
+config) and applies immediately, reporting the old value. Prefer it to editing
+that file by hand: a `sed` whose pattern matches nothing leaves you convinced a
+setting changed while the node keeps running the old one.
 
 A deploy only runs when the branch head moved (the timer is otherwise silent),
 takes one deploy at a time via flock, and never rotates secrets — `NEW_SECRET`
