@@ -51,10 +51,27 @@ That is the variant this repo ships.
 ```bash
 # on the box that already runs a site (e.g. tldw), as root:
 sudo WEB_HOST=cdn.example.com \
+     SITE_HOST=tldw.example.com SITE_UPSTREAM=http://127.0.0.1:8080 \
      DECOY_UPSTREAM=http://127.0.0.1:8080 \
      EMAIL=admin@example.com \
      bash setup-telemt-web-node.sh
 ```
+
+nginx is installed if missing. Ports 80 and 443 must end up nginx's, and the
+script refuses early (naming the holder) if they are not:
+
+- **443 held by telemt** is expected — the fake-TLS listener is moved to 8443,
+  which invalidates links that used port 443. Pass `PORT=` to choose another
+  port, or `KEEP_MTPROTO=0` for a WEB-only node.
+- **80 held by a Docker container** (a common shape: the app published as
+  `-p 80:80`) must be republished on loopback — `-p 127.0.0.1:8080:80` — and then
+  passed as `SITE_HOST`/`SITE_UPSTREAM`, so the same nginx serves that site over
+  HTTPS on its own hostname next to the proxy vhost.
+
+> Keeping fake-TLS on the public 443 via SNI routing (nginx `stream` +
+> `ssl_preread`) looks tempting but breaks `client_mss`: the ServerHello
+> fragmentation that gets past TSPU needs telemt's own socket to the client,
+> not one to a local proxy.
 
 The script installs telemt (pinned 3.5.7), writes a config with **both**
 transports — the existing fake-TLS listener (secret reused, moved off 443 to
