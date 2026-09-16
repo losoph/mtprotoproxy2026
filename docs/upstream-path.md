@@ -32,6 +32,28 @@ journalctl -u telemt-upstream-probe --since '24 hours ago' | grep summary
 telemt-probe-report.sh --to you@example.com --dry-run     # full picture, one screen
 ```
 
+## ME mode was tried on tldw and does not work there (2026-09-16)
+
+`USE_MIDDLE_PROXY=1` was applied and telemt could not start ME at all:
+
+```
+Proxy-secret download failed … core.telegram.org:443: Connection timeout to 149.154.167.99:443
+ME startup failed: proxy-secret is unavailable and no saved secret found; falling back to direct mode
+Transport: Direct DC startup fallback active; Middle-End bootstrap continues in background
+```
+
+That is the decisive measurement: the timeouts are not about one DC address but
+about Telegram's prefixes as a whole — `core.telegram.org` (149.154.167.99) is in
+the same `149.154.160.0/20` that DC2 lives in, and the middle-proxy endpoints ME
+would use are in those prefixes too. Supplying the secret out of band
+(`proxy_secret_path`) would therefore not rescue ME; it would only move the
+failure one step later.
+
+ME in this state is not neutral: telemt retries the bootstrap every ~5 s and each
+failed attempt marks upstreams unhealthy, so the direct path degrades as well
+(`No healthy upstreams available! Using random`). Leave `USE_MIDDLE_PROXY=0` on
+this node until its egress changes.
+
 ## Middle-proxy mode: what it changes, and the trap on this node
 
 `use_middle_proxy = true` routes through Telegram's own middle-proxy (ME)
@@ -72,14 +94,28 @@ Also worth knowing before switching:
 
 1. **Collect a full day** with the probe and the mailed report. A single quiet
    spot check means nothing; this fault is episodic.
-2. **If bad cycles are DC-only** (the current picture): try `USE_MIDDLE_PROXY=1`
-   with the NAT address set, then compare the next day's report against the
-   numbers in the table above. Same tooling, same metric — that is the point of
-   recording them here.
+2. **If bad cycles are DC-only**: `USE_MIDDLE_PROXY=1` with the NAT address set
+   is the cheap thing to try — but on tldw it was tried and failed at the
+   proxy-secret fetch (above), because the filtering covers the prefixes and not
+   a single address. Check the startup logs, don't assume it took.
 3. **If bad cycles take the neutral controls with them**: it is the provider's
    link or transit, and no proxy setting fixes it. Take the timestamps to
    Selectel.
-4. **If ME mode does not move the numbers**: the durable fix is a node outside the
-   filtered network — the same scripts, a hostname pointed at it. The client side
-   is already the censorship-resistant half; it is the egress that needs to be
-   somewhere else.
+4. **If ME mode does not move the numbers** (tldw: it cannot even start): the
+   egress has to leave the filtered network. Two shapes, both keeping the
+   already-proven client side:
+
+   - **Move the proxy to a node outside the filtered network.** Same scripts, a
+     hostname pointed at the new address. A client in Russia then makes an
+     ordinary HTTPS connection to an ordinary foreign site, which is what WEB
+     mode is for. fake-TLS also becomes worth re-enabling there for phones,
+     which WEB does not serve. Simplest, one moving part.
+   - **Keep the proxy here and tunnel only its egress** (WireGuard to a cheap
+     foreign VPS, policy-routing Telegram prefixes — `149.154.160.0/20`,
+     `91.108.4.0/22`, `91.108.8.0/21`, `91.108.16.0/21`, `91.108.56.0/22`,
+     `91.105.192.0/23` — through it). Keeps clients on the local low-latency
+     address and next to the existing site, at the cost of a tunnel to keep
+     alive and routing that must survive reboots.
+
+   Note what does *not* change either way: the bots on this host reach Telegram
+   on their own and keep failing until their traffic is routed too.

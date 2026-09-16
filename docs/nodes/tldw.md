@@ -54,6 +54,10 @@ All six containers (`whisper-app-{nginx,web,worker,ollama}`, `unagi-bot`,
   `KEEP_MTPROTO=1` and `PORT=8443` in `/etc/telemt/deploy.env` and run
   `deploy.sh --force`; the previous `tldw` user secret is in
   `/root/telemt-config.toml.bak`, and its links need the new port.
+- **ME (middle-proxy) mode is off and must stay off here.** It was tried on
+  2026-09-16 and cannot start: the proxy-secret fetch from `core.telegram.org`
+  times out like everything else in Telegram's prefixes, and the retry loop
+  degrades the direct path too. See [`../upstream-path.md`](../upstream-path.md).
 - **Site limits.** `SITE_MAX_BODY=512m` and `SITE_TIMEOUT=300s` exist because
   nginx's 1 MiB body limit and 60 s proxy timeout would silently break the
   application's audio uploads.
