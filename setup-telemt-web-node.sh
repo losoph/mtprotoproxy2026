@@ -182,10 +182,15 @@ else
   if [ ! -f "$STATE/public/index.html" ]; then
     cat > "$STATE/public/index.html" <<'HTML'
 <!doctype html>
+<html lang="en">
 <meta charset="utf-8">
-<title>Service</title>
-<h1>It works</h1>
-<p>This endpoint hosts static assets.</p>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Static assets</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;margin:8% auto;max-width:34em;padding:0 1em;color:#222}</style>
+<h1>Static assets</h1>
+<p>This host serves static files for internal applications. There is no
+public index; request a file by its path.</p>
 HTML
   fi
   DECOY_TOML="mode = \"static_directory\"
@@ -465,6 +470,15 @@ if [ ! -s "$CERT_DIR/fullchain.pem" ] && [ "$CERTBOT" = 1 ]; then
   fi
 fi
 [ -s "$CERT_DIR/fullchain.pem" ] || die "no certificate at $CERT_DIR — obtain one, then re-run (or set CERTBOT=0 and edit the vhost)"
+
+# A renewed certificate is only served once nginx re-reads it, and `certbot
+# certonly` reloads nothing by itself — so a silent expiry in 90 days would take
+# the proxy down with the site. One deploy hook covers every cert on the box.
+if [ -d /etc/letsencrypt ]; then
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  printf '#!/bin/sh\nsystemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+  chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+fi
 
 write_tls
 nginx -t || die "nginx config test failed"
