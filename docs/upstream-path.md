@@ -18,19 +18,66 @@ check of the proxy passes.
 | Host | load 0.00, 100% idle, conntrack 156/262144 — never the bottleneck |
 | Other consumers | `tndr-bot` (Bot API) loops on `TelegramNetworkError: Request timeout`; `unagi-bot` (MTProto) talks to the same `149.154.167.51` |
 
-Read together: the loss is episodic, hits Telegram ranges only, leaves ICMP and
-neutral destinations untouched, concentrates on one DC address, and affects three
-independent consumers on the box. That is the signature of filtering on Telegram
-ranges somewhere in the provider's path, not congestion, not this host, and not
-the proxy's configuration. `TcpRetransSegs ≈ TcpExtTCPTimeouts` in every sample,
-i.e. recoveries are RTO-driven (packets dropped) rather than fast retransmits.
+**First reading (wrong, kept as a warning):** loss that is episodic, hits only
+Telegram addresses, leaves ICMP and neutral destinations alone, and affects three
+independent consumers looks exactly like filtering of Telegram prefixes. It is
+not, on this node.
 
-Keep collecting with the tooling rather than by hand:
+## What it actually was: one VPN account used by two tunnels
 
-```bash
-journalctl -u telemt-upstream-probe --since '24 hours ago' | grep summary
-telemt-probe-report.sh --to you@example.com --dry-run     # full picture, one screen
+This node routes Telegram prefixes into an OpenVPN tunnel (`tun10`/`tun11`,
+`openvpn-client@tldw-{main,media}`), and Google prefixes into the other. Both
+connect to **the same server** (`nl3.pvpn.pw`) with **the same credential**, so
+both get the same client address, `192.168.101.4`.
+
+An OpenVPN server without `duplicate-cn` evicts the previous session when the same
+certificate connects again. The evicted client learns nothing over UDP and only
+notices at `ping-restart`, about three minutes later — then it reconnects and
+evicts the other one. Forever:
+
 ```
+496 Initialization Sequence Completed in 24 h  (one every ~3 min)
+[nl3.pvpn.pw] Inactivity timeout (--ping-restart), restarting   # alternating pids
+```
+
+Both configs use `route-nopull`, so the prefix routes are laid by an external
+script on each tunnel-up event. With the tunnels restarting in turn, the Telegram
+prefixes bounce between `tun10` and `tun11` — `ip route get` said `dev tun10`
+while a `tcpdump` six minutes later caught the traffic on `tun11`. Each bounce
+kills connections in flight and times out new ones, on every Telegram address at
+once, while `eth0` destinations never notice.
+
+That is the whole fault: telemt's 2478 timeouts and 452 "No healthy upstreams",
+the probe's DC-only bad cycles, and the bots' constant `TelegramNetworkError`.
+Not TSPU, not the prefixes, not the proxy.
+
+Note what the other evidence really meant, once this is known:
+
+- `rp_filter = 2` (loose) everywhere, and the `tcpdump` showed request *and* reply
+  on the same interface — so there was never an asymmetry problem to fix.
+- STUN reporting `81.4.107.87` while the interface is `45.145.64.58` is simply the
+  VPN exit address: STUN went out through a tunnel. So for ME mode,
+  `middle_proxy_nat_ip = "45.145.64.58"` is **wrong** on this node — Telegram sees
+  the tunnel's exit, which changes on reconnect. `middle_proxy_nat_probe = true`
+  is the only sane setting here, and only once the tunnels are stable.
+- The two tunnels give no geographic spread at all: they terminate on the same
+  server.
+
+### Fixing it
+
+1. **One tunnel, not two on one account.** Stop the redundant unit and put both
+   prefix sets on the survivor (`tun11` demonstrably reaches Telegram at 41 ms).
+   Free, immediate, removes the eviction loop.
+2. **Or a second credential** from the provider, so two simultaneous sessions are
+   legitimate. Only worth it if the tunnels are meant to terminate somewhere
+   different — which today they do not.
+3. Regardless: the route-laying script must pin each prefix set to one device
+   deterministically, and `tun-mtu 1400` with `mssfix` removes the reliance on
+   fragmentation that an MTU of 1500 inside a tunnel guarantees.
+4. **Or remove the tunnels from the picture** by putting the proxy on a node
+   outside the filtered network, where egress to Telegram needs no tunnel. Today
+   the proxy's stability depends on how `pvpn.pw` hands addresses to two
+   connections — a link nobody here controls.
 
 ## ME mode was tried on tldw and does not work there (2026-09-16)
 

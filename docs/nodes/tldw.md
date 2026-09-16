@@ -62,6 +62,24 @@ All six containers (`whisper-app-{nginx,web,worker,ollama}`, `unagi-bot`,
   nginx's 1 MiB body limit and 60 s proxy timeout would silently break the
   application's audio uploads.
 
+## The tunnels (the thing that actually broke)
+
+Telegram prefixes do not leave this node directly: they are routed into an
+OpenVPN tunnel (`openvpn-client@tldw-main` / `tldw-media`, `tun10` / `tun11`),
+Google prefixes into the other. Both terminate on the same `nl3.pvpn.pw` with the
+same credential and the same client address, which made the server evict each
+session in turn — 496 reconnects a day, and the Telegram routes bouncing between
+the two devices. That, not censorship, was behind every symptom measured on
+2026-09-16. Full account in [`../upstream-path.md`](../upstream-path.md).
+
+Anything diagnosing this proxy has to check the egress path first:
+
+```bash
+ip route get 149.154.167.51                 # which device, right now
+journalctl -u 'openvpn*' --since '24 hours ago' | grep -c 'Initialization Sequence Completed'
+journalctl -u telemt-upstream-probe --since today | grep 'egress moved'
+```
+
 ## Verified state
 
 WEB works end to end: a Telegram Desktop client negotiated `websocket-lanes` on

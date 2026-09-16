@@ -95,6 +95,15 @@ TG_NOUPSTREAM="$(printf '%s\n' "$TELEMT_LOG" | count 'No healthy upstreams')"
 TG_RECOVERED="$(printf '%s\n' "$TELEMT_LOG" | count 'Upstream recovered')"
 TG_PER_IP="$(printf '%s\n' "$TELEMT_LOG" | grep -o 'Connection timeout to [0-9.]*' | sort | uniq -c | sort -rn || true)"
 
+# Tunnel churn: on a node that routes Telegram through a VPN, reconnects are the
+# fault, not a detail — each one re-lays the routes and breaks live connections.
+TUN_RECONNECTS="$(journalctl -u 'openvpn*' --since "$SINCE" --no-pager 2>/dev/null | count 'Initialization Sequence Completed')"
+TUN_REASONS="$(journalctl -u 'openvpn*' --since "$SINCE" --no-pager 2>/dev/null \
+  | grep -oE 'Inactivity timeout|ping-restart|TLS key negotiation failed|Connection reset|AUTH_FAILED' \
+  | sort | uniq -c | sort -rn | head -5 || true)"
+EGRESS_MOVES="$(printf '%s\n' "$PROBE_ALL" | count 'telegram egress moved')"
+EGRESS_DEV="$(ip route get "${DC_IPS%% *}" 2>/dev/null | sed -n '1s/.* dev \([^ ]*\).*/\1/p')"
+
 BOTS=""
 if command -v docker >/dev/null; then
   for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei 'bot' || true); do
@@ -117,7 +126,14 @@ LIVE=""
 for ip in $DC_IPS $CONTROL_IPS; do LIVE="$LIVE  $ip $(probe_once "$ip")\n"; done
 
 # ---- verdict ------------------------------------------------------------------
-if [ "$BAD_N" = 0 ]; then
+if [ "${TUN_RECONNECTS:-0}" -gt 20 ] || [ "${EGRESS_MOVES:-0}" -gt 2 ]; then
+  VERDICT="The egress itself is unstable: $TUN_RECONNECTS tunnel reconnects and
+$EGRESS_MOVES egress moves in this window. Every move re-lays the routes and
+breaks connections in flight, which is indistinguishable from upstream filtering
+in connect tests. Fix the tunnels before drawing any conclusion about censorship
+— and check for one VPN account used by two simultaneous tunnels, which makes the
+server evict each session in turn."
+elif [ "$BAD_N" = 0 ]; then
   VERDICT="No bad cycles in the window. The path held; the earlier incident was
 not reproduced. Nothing to change — keep collecting."
 elif [ "$BOTH" -gt "$DC_ONLY" ]; then
@@ -154,6 +170,12 @@ Report:   $(date '+%F %T %Z')
   "No healthy upstreams":  $TG_NOUPSTREAM
   "Upstream recovered":    $TG_RECOVERED
 $( [ -n "$TG_PER_IP" ] && printf '  per address:\n%s\n' "$(printf '%s\n' "$TG_PER_IP" | sed 's/^/    /')" )
+
+== Egress path ==
+  Telegram leaves by:      ${EGRESS_DEV:-unknown}
+  egress moves in window:  $EGRESS_MOVES   (each one breaks live connections)
+  tunnel reconnects:       $TUN_RECONNECTS
+$( [ -n "$TUN_REASONS" ] && printf '  reasons:\n%s\n' "$(printf '%s\n' "$TUN_REASONS" | sed 's/^/    /')" )
 
 == Other consumers of the same path (Telegram bots on this host) ==
 $(printf '%b' "${BOTS:-  (none found)}")
