@@ -63,10 +63,13 @@ script refuses early (naming the holder) if they are not:
 - **443 held by telemt** is expected — the fake-TLS listener is moved to 8443,
   which invalidates links that used port 443. Pass `PORT=` to choose another
   port, or `KEEP_MTPROTO=0` for a WEB-only node.
-- **80 held by a Docker container** (a common shape: the app published as
-  `-p 80:80`) must be republished on loopback — `-p 127.0.0.1:8080:80` — and then
-  passed as `SITE_HOST`/`SITE_UPSTREAM`, so the same nginx serves that site over
-  HTTPS on its own hostname next to the proxy vhost.
+- **80 held by a Docker container** (a common shape: the app, or its own
+  containerized nginx, published as `-p 80:80`) must be republished on loopback —
+  `-p 127.0.0.1:8080:80` — and then passed as `SITE_HOST`/`SITE_UPSTREAM`, so the
+  host nginx serves that site over HTTPS on its own hostname next to the proxy
+  vhost. `SITE_MAX_BODY` (default 512m) and `SITE_TIMEOUT` (300s) exist because
+  nginx's 1m body limit and 60s proxy timeout silently break an app that takes
+  uploads or answers slowly.
 
 > Keeping fake-TLS on the public 443 via SNI routing (nginx `stream` +
 > `ssl_preread`) looks tempting but breaks `client_mss`: the ServerHello
