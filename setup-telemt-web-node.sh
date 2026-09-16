@@ -36,6 +36,12 @@ DECOY_UPSTREAM="${DECOY_UPSTREAM:-}"  # e.g. http://127.0.0.1:8080 — a private
                                       # loopback origin of the site shown to
                                       # anyone who is not a proxy client.
                                       # Empty => a static placeholder snapshot.
+SITE_HOST="${SITE_HOST:-}"            # optional: hostname of the site this box
+                                      # already serves (e.g. tldw.orangerd.ru).
+                                      # Given with SITE_UPSTREAM, nginx also
+                                      # terminates TLS for it — handy when the
+                                      # app used to sit on port 80 with no HTTPS.
+SITE_UPSTREAM="${SITE_UPSTREAM:-}"    # its local origin, e.g. http://127.0.0.1:8080
 WEB_USERNAME="${WEB_USERNAME:-webproxy}"
 WEB_LISTEN_PORT="${WEB_LISTEN_PORT:-18080}"   # private plain-HTTP listener
 WEB_CARRIER="${WEB_CARRIER:-https}"           # final fallback; iOS supports only this
@@ -71,6 +77,33 @@ case "$SECRET_MODE" in dd|plain) ;; *) die "SECRET_MODE must be dd or plain (ee 
 if [ "$KEEP_MTPROTO" = 1 ] && [ "$PORT" = 443 ]; then
   PORT=8443
   log "port 443 is nginx's on this box — fake-TLS MTProto moved to $PORT (override with PORT=)"
+fi
+
+# ---- preflight: ports 80/443 must be ours ------------------------------------
+# nginx has to own both (80 for ACME + redirect, 443 for the WEB endpoint —
+# Telegram Desktop requires port 443). telemt on 443 is fine: it is moved to
+# $PORT further down. Anything else has to be relocated first, so say so now
+# instead of failing halfway through an nginx install.
+port_holder(){
+  command -v ss >/dev/null || return 0   # no ss: skip the check, nginx will complain
+  ss -ltnpH "sport = :$1" 2>/dev/null | sed -n '1s/.*users:(("\([^"]*\)".*/\1/p'
+}
+H80="$(port_holder 80)"
+case "$H80" in
+  ""|nginx) ;;
+  *) die "port 80 is held by '$H80' — nginx needs it (ACME + redirect).
+    If that is a Docker container, republish it on loopback instead, e.g.
+    -p 127.0.0.1:8080:80 (or ports: 127.0.0.1:8080:80 in compose), then pass
+    SITE_HOST=<its hostname> SITE_UPSTREAM=http://127.0.0.1:8080 so nginx
+    serves it over HTTPS as well." ;;
+esac
+H443="$(port_holder 443)"
+case "$H443" in
+  ""|nginx|telemt) ;;
+  *) die "port 443 is held by '$H443' — the WEB endpoint must be on 443. Move that service first." ;;
+esac
+if [ -n "$SITE_HOST" ] && [ -z "$SITE_UPSTREAM" ]; then
+  die "SITE_HOST needs SITE_UPSTREAM (the site's local origin, e.g. http://127.0.0.1:8080)"
 fi
 
 mkdir -p "$STATE" /etc/telemt "$STATE/tlsfront"
@@ -285,8 +318,11 @@ if ! curl -fsS --max-time 5 -H "Authorization: Bearer $API_TOKEN" \
 fi
 
 # ---- nginx ------------------------------------------------------------------------
-command -v nginx >/dev/null || die "nginx not found — WEB mode needs an external TLS terminator"
-log "nginx vhost for $WEB_HOST"
+if ! command -v nginx >/dev/null; then
+  log "installing nginx (WEB mode needs an external TLS terminator)"
+  apt-get update -qq && apt-get install -y -qq nginx
+fi
+log "nginx vhost for $WEB_HOST${SITE_HOST:+ (+ site $SITE_HOST)}"
 NG_AVAIL=/etc/nginx/sites-available; NG_EN=/etc/nginx/sites-enabled
 [ -d "$NG_AVAIL" ] || { NG_AVAIL=/etc/nginx/conf.d; NG_EN=/etc/nginx/conf.d; }
 CERT_DIR="/etc/letsencrypt/live/$WEB_HOST"
@@ -296,7 +332,7 @@ write_http_only(){
 server {
     listen 80;
     listen [::]:80;
-    server_name $WEB_HOST;
+    server_name $WEB_HOST${SITE_HOST:+ $SITE_HOST};
     location /.well-known/acme-challenge/ { root /var/www/html; }
     location / { return 301 https://\$host\$request_uri; }
 }
@@ -367,6 +403,31 @@ $(nginx_http2_lines)
     }
 }
 EOF
+  # The ordinary site keeps its own hostname and its own vhost: the proxy vhost
+  # must stay a plain website to anyone who is not a carrier client.
+  if [ -n "$SITE_HOST" ]; then
+    cat >> "$NG_AVAIL/telemt-web.conf" <<EOF
+
+server {
+$(nginx_http2_lines)
+    server_name $SITE_HOST;
+
+    ssl_certificate     $CERT_DIR/fullchain.pem;
+    ssl_certificate_key $CERT_DIR/privkey.pem;
+
+    location / {
+        proxy_pass $SITE_UPSTREAM;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$telemt_connection_upgrade;
+    }
+}
+EOF
+  fi
 }
 
 if [ "$NG_EN" != "$NG_AVAIL" ]; then
@@ -379,10 +440,12 @@ if [ ! -s "$CERT_DIR/fullchain.pem" ] && [ "$CERTBOT" = 1 ]; then
   mkdir -p /var/www/html
   write_http_only
   nginx -t && systemctl reload nginx
+  CB_DOMAINS=(-d "$WEB_HOST")
+  [ -n "$SITE_HOST" ] && CB_DOMAINS+=(--cert-name "$WEB_HOST" -d "$SITE_HOST")
   if [ -n "$EMAIL" ]; then
-    certbot certonly --webroot -w /var/www/html -d "$WEB_HOST" -m "$EMAIL" --agree-tos -n
+    certbot certonly --webroot -w /var/www/html "${CB_DOMAINS[@]}" -m "$EMAIL" --agree-tos -n
   else
-    certbot certonly --webroot -w /var/www/html -d "$WEB_HOST" --register-unsafely-without-email --agree-tos -n
+    certbot certonly --webroot -w /var/www/html "${CB_DOMAINS[@]}" --register-unsafely-without-email --agree-tos -n
   fi
 fi
 [ -s "$CERT_DIR/fullchain.pem" ] || die "no certificate at $CERT_DIR — obtain one, then re-run (or set CERTBOT=0 and edit the vhost)"
@@ -430,7 +493,8 @@ Notes:
   * Turn on the debug view by adding [web.debug] enabled = true and reloading, then
     open http://127.0.0.1:9091/web-status through an SSH tunnel.
   * $WEB_HOST must serve ONLY this proxy vhost. Keep the real site on its own
-    hostname; the decoy is what casual visitors of $WEB_HOST see.
+    hostname; the decoy is what casual visitors of $WEB_HOST see.${SITE_HOST:+
+  * $SITE_HOST is served over HTTPS from $SITE_UPSTREAM by the same nginx.}
   * Full upstream guide:
     https://github.com/telemt/telemt/blob/main/docs/WEB/WEB_PROXY.en.md
 EOF
