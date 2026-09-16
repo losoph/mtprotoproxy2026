@@ -81,6 +81,26 @@ journalctl -u 'openvpn*' --since '24 hours ago' | grep -c 'Initialization Sequen
 journalctl -u telemt-upstream-probe --since today | grep 'egress moved'
 ```
 
+### Decision (2026-09-17) and what is still open
+
+Chosen: **one tunnel**. `tldw-main` is disabled; `tldw-media` (`tun11`, `proto udp`
+with TCP remotes as fallback in the same config, so failover is already inherent)
+carries both prefix sets. That ends the eviction loop without losing UDP speed.
+
+Still open, for the next session:
+
+- The Telegram prefix routes were moved with `ip route replace … dev tun11`, which
+  does **not** survive a reboot. Find the script that lays them (the configs use
+  `route-nopull`, so something external does) and pin them to `tun11` there.
+- `tun-mtu 1400` + `mssfix 1360` in `tldw-media.conf`: MTU 1500 inside the tunnel
+  guarantees fragmentation on every large packet.
+- If two simultaneous tunnels are ever wanted again, the provider has siblings —
+  `nl1 195.123.220.143`, `nl2 167.104.160.148`, `nl4 81.4.108.105`,
+  `nl5 81.4.127.107` — and eviction is per-server, so two servers with one
+  certificate is the cheap way to make them legitimate. Never `ru3`.
+- The 21:00 report is the before/after: expect it to still show hundreds of
+  reconnects for the hours before this change.
+
 ## Verified state
 
 WEB works end to end: a Telegram Desktop client negotiated `websocket-lanes` on
