@@ -60,17 +60,34 @@ Note what the other evidence really meant, once this is known:
   `middle_proxy_nat_ip = "45.145.64.58"` is **wrong** on this node — Telegram sees
   the tunnel's exit, which changes on reconnect. `middle_proxy_nat_probe = true`
   is the only sane setting here, and only once the tunnels are stable.
-- The two tunnels give no geographic spread at all: they terminate on the same
-  server.
+- The two tunnels exist on purpose: one carries media (YouTube) over a **UDP**
+  transport, which is measurably faster than OpenVPN over TCP, and the other
+  carries Telegram. The split was sound; what breaks is that both terminate on
+  the same server with the same credential. Do not "just drop one" without
+  knowing which transport it is — and note that the tunnel which works and
+  reaches Telegram at 41 ms is the media one.
 
 ### Fixing it
 
-1. **One tunnel, not two on one account.** Stop the redundant unit and put both
-   prefix sets on the survivor (`tun11` demonstrably reaches Telegram at 41 ms).
-   Free, immediate, removes the eviction loop.
-2. **Or a second credential** from the provider, so two simultaneous sessions are
-   legitimate. Only worth it if the tunnels are meant to terminate somewhere
-   different — which today they do not.
+1. **One tunnel with transport failover**, which keeps the UDP speed and the TCP
+   fallback without a second session. OpenVPN tries `<connection>` blocks in
+   order, so one client, one credential, no eviction:
+
+   ```
+   <connection>
+   remote nl3.pvpn.pw 1194 udp
+   </connection>
+   <connection>
+   remote nl3.pvpn.pw 443 tcp
+   </connection>
+   ```
+
+   Both prefix sets then ride the surviving device.
+2. **Or keep two simultaneous tunnels, legitimately**: a second credential (the
+   provider then also hands out distinct client addresses, which removes the
+   shared-`192.168.101.4` ambiguity), or two different servers — eviction is
+   per-server, so `nl3` + `nl4` usually coexist on one certificate. Not `ru3`: a
+   Russian exit puts the egress back under the filtering it is there to avoid.
 3. Regardless: the route-laying script must pin each prefix set to one device
    deterministically, and `tun-mtu 1400` with `mssfix` removes the reliance on
    fragmentation that an MTU of 1500 inside a tunnel guarantees.

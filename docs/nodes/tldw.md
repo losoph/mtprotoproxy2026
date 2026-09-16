@@ -66,9 +66,10 @@ All six containers (`whisper-app-{nginx,web,worker,ollama}`, `unagi-bot`,
 
 Telegram prefixes do not leave this node directly: they are routed into an
 OpenVPN tunnel (`openvpn-client@tldw-main` / `tldw-media`, `tun10` / `tun11`),
-Google prefixes into the other. Both terminate on the same `nl3.pvpn.pw` with the
-same credential and the same client address, which made the server evict each
-session in turn — 496 reconnects a day, and the Telegram routes bouncing between
+Google prefixes into the other — deliberately, because the media tunnel runs over
+UDP and is faster than OpenVPN over TCP. Both terminate on the same `nl3.pvpn.pw`
+with the same credential and the same client address, which made the server evict
+each session in turn — 496 reconnects a day, and the Telegram routes bouncing between
 the two devices. That, not censorship, was behind every symptom measured on
 2026-09-16. Full account in [`../upstream-path.md`](../upstream-path.md).
 
