@@ -42,17 +42,26 @@ ME startup failed: proxy-secret is unavailable and no saved secret found; fallin
 Transport: Direct DC startup fallback active; Middle-End bootstrap continues in background
 ```
 
-That is the decisive measurement: the timeouts are not about one DC address but
-about Telegram's prefixes as a whole — `core.telegram.org` (149.154.167.99) is in
-the same `149.154.160.0/20` that DC2 lives in, and the middle-proxy endpoints ME
-would use are in those prefixes too. Supplying the secret out of band
-(`proxy_secret_path`) would therefore not rescue ME; it would only move the
-failure one step later.
+`core.telegram.org` (149.154.167.99) is in the same `149.154.160.0/20` as DC2, so
+whatever breaks the DC path breaks the ME bootstrap too. But this is **not** a
+permanent block: minutes later the same process logged
+`Downloaded proxy-secret OK len=128`. ME failed because it happened to start
+during an outage window, not because the fetch is impossible — do not read the
+first conclusion here as "ME can never work".
+
+**This node routes Telegram prefixes over OpenVPN tunnels.** That reframes the
+probe's "DCs failed, neutral controls held" signature: the controls (1.1.1.1,
+GitHub) leave through `eth0` while the Telegram prefixes leave through a tunnel,
+so a flapping tunnel or a blocked VPN endpoint produces exactly the same picture
+as upstream filtering. The probe cannot tell them apart — it does not record
+which interface a destination leaves by. Diagnose the tunnels before concluding
+anything about censorship, and before moving the node.
 
 ME in this state is not neutral: telemt retries the bootstrap every ~5 s and each
 failed attempt marks upstreams unhealthy, so the direct path degrades as well
-(`No healthy upstreams available! Using random`). Leave `USE_MIDDLE_PROXY=0` on
-this node until its egress changes.
+(`No healthy upstreams available! Using random`). Keep `USE_MIDDLE_PROXY=0` until
+the tunnel situation is understood; retry it only from a known-good path, so a
+failure means something.
 
 ## Middle-proxy mode: what it changes, and the trap on this node
 
