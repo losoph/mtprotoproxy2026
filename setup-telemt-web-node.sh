@@ -77,6 +77,10 @@ case "$SECRET_MODE" in dd|plain) ;; *) die "SECRET_MODE must be dd or plain (ee 
 if [ "$KEEP_MTPROTO" = 1 ] && [ "$PORT" = 443 ]; then
   PORT=8443
   log "port 443 is nginx's on this box — fake-TLS MTProto moved to $PORT (override with PORT=)"
+elif [ "$KEEP_MTPROTO" = 0 ] && [ "$PORT" = 443 ]; then
+  # WEB-only: no MTProxy listener is written, but keep server.port off 443 so a
+  # default bind can never race nginx for the WEB endpoint's own port.
+  PORT=18443
 fi
 
 # ---- preflight: ports 80/443 must be ours ------------------------------------
