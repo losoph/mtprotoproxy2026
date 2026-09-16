@@ -340,8 +340,12 @@ fi
 # "No healthy upstreams available") look like a broken proxy to users while every
 # manual check passes. Keep a continuous record so the cause is decidable later.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE_BIN=/usr/local/bin/telemt-upstream-probe.sh
 if [ "$UPSTREAM_PROBE" = 1 ] && [ -f "$SELF_DIR/tools/upstream-probe.sh" ]; then
   log "upstream probe"
+  # Install it out of the repo: the unit runs with ProtectHome=true, so a script
+  # under /root (the usual place for a deploy checkout) is invisible to it.
+  install -m 755 "$SELF_DIR/tools/upstream-probe.sh" "$PROBE_BIN"
   cat > /etc/systemd/system/telemt-upstream-probe.service <<EOF
 [Unit]
 Description=Probe the node's path to the Telegram DCs (records episodic loss)
@@ -350,7 +354,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env bash $SELF_DIR/tools/upstream-probe.sh
+ExecStart=$PROBE_BIN
 Restart=always
 RestartSec=10
 Nice=10
@@ -368,7 +372,7 @@ EOF
 elif [ -f /etc/systemd/system/telemt-upstream-probe.service ]; then
   log "removing upstream probe (UPSTREAM_PROBE=$UPSTREAM_PROBE)"
   systemctl disable --now telemt-upstream-probe.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/telemt-upstream-probe.service
+  rm -f /etc/systemd/system/telemt-upstream-probe.service "$PROBE_BIN"
   systemctl daemon-reload
 fi
 
