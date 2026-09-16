@@ -126,6 +126,12 @@ Editing `/etc/nginx/*` or `/etc/telemt/*` on the node is not a shortcut: the
 next deploy overwrites it, and in between the box is in a state no commit
 describes. Fix it in the repo, push, deploy.
 
+`USE_MIDDLE_PROXY=1` (with `MIDDLE_PROXY_NAT_IP`, and `AD_TAG` if you have one)
+switches the upstream to Telegram's middle proxies when the node's direct DC
+addresses are filtered — read [`docs/upstream-path.md`](docs/upstream-path.md)
+first, the NAT address is not optional on a provider that egresses from another
+IP.
+
 > Keeping fake-TLS on the public 443 via SNI routing (nginx `stream` +
 > `ssl_preread`) looks tempting but breaks `client_mss`: the ServerHello
 > fragmentation that gets past TSPU needs telemt's own socket to the client,
@@ -187,6 +193,15 @@ secret for your fronting domain, and applies hardening (ufw, fail2ban, scanner
 blocklist on SSH only, swap, service trim). It prints the `t.me/proxy?...` link
 at the end. Re-runnable; pass `SSH_HARDEN=1` to also disable password login,
 `NEW_SECRET=1` to rotate the secret.
+
+## Node docs
+
+- [`docs/nodes/tldw.md`](docs/nodes/tldw.md) — the node in production: port
+  ownership, the decisions behind it, what is verified and what is not.
+- [`docs/upstream-path.md`](docs/upstream-path.md) — the node's egress to the
+  Telegram DCs: measurements, the `USE_MIDDLE_PROXY=1` playbook (and the NAT
+  address trap), and when to move the node instead.
+- [`CLAUDE.md`](CLAUDE.md) — conventions for changing any of this.
 
 ## The 2026 TSPU reality (read this)
 

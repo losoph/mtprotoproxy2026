@@ -74,7 +74,7 @@ fi
 [ -n "$REPORT_TO" ] || { echo "REPORT_TO is unset (use --to you@example.com)" >&2; exit 1; }
 
 # ---- collect ------------------------------------------------------------------
-count(){ grep -c "$1" 2>/dev/null || true; }
+count(){ grep -Eic -- "$1" 2>/dev/null || true; }
 jq_probe(){ journalctl -u telemt-upstream-probe --since "$SINCE" --no-pager -o short-iso 2>/dev/null; }
 jq_telemt(){ journalctl -u telemt --since "$SINCE" --no-pager -o short-iso 2>/dev/null; }
 
@@ -98,7 +98,7 @@ TG_PER_IP="$(printf '%s\n' "$TELEMT_LOG" | grep -o 'Connection timeout to [0-9.]
 BOTS=""
 if command -v docker >/dev/null; then
   for c in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -Ei 'bot' || true); do
-    n="$(docker logs --since "${WINDOW_HOURS}h" "$c" 2>&1 | count -iE 'timeout|TelegramNetworkError|ConnectionError')"
+    n="$(docker logs --since "${WINDOW_HOURS}h" "$c" 2>&1 | count 'timeout|TelegramNetworkError|ConnectionError')"
     BOTS="$BOTS  $c: $n network-error lines\n"
   done
 fi
@@ -136,7 +136,7 @@ SUBJECT="[telemt] Telegram path: $BAD_N bad cycles / ~$EXPECTED_CYCLES on $(host
 FROM="$(awk '$1=="from"{print $2; exit}' /etc/msmtprc 2>/dev/null || true)"
 
 BODY="$(cat <<EOF
-Node:     $(hostname -f) ($(hostname -I | awk '{print $1}'))
+Node:     $(hostname -s) ($(hostname -I | awk '{print $1}'))
 Window:   last $WINDOW_HOURS h (since $(date -d "$SINCE" '+%F %T %Z' 2>/dev/null || echo "$SINCE"))
 Report:   $(date '+%F %T %Z')
 
