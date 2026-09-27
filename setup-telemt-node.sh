@@ -33,7 +33,7 @@ USERNAME="${USERNAME:-proxy}"         # access.users key; multiple users = re-ru
 CLIENT_MSS="${CLIENT_MSS:-tspu}"
 CLIENT_MSS_BULK="${CLIENT_MSS_BULK:-1400}"
 # Pin deliberately; bump after checking https://github.com/telemt/telemt/releases
-TELEMT_VERSION="${TELEMT_VERSION:-3.5.5}"
+TELEMT_VERSION="${TELEMT_VERSION:-3.5.8}"
 NEW_SECRET="${NEW_SECRET:-0}"
 STATE=/var/lib/telemt
 BIN=/usr/local/bin/telemt

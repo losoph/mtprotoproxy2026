@@ -74,8 +74,10 @@ UPSTREAM_PROBE="${UPSTREAM_PROBE:-1}"   # continuous probe of the node's path to
                                         # the Telegram DCs; 0 removes it. It logs
                                         # only bad cycles, so the journal stays quiet.
 
-# WEB needs the fixes/lifecycle controls of the 3.5.6+ line.
-TELEMT_VERSION="${TELEMT_VERSION:-3.5.7}"
+# WEB needs the fixes/lifecycle controls of the 3.5.6+ line. 3.5.8 adds optional
+# path-scoped WEB ingress (base_path) and a batch of filesystem/TLS hardening;
+# see docs/upstream-tracking.md for what was checked before pinning it.
+TELEMT_VERSION="${TELEMT_VERSION:-3.5.8}"
 NEW_SECRET="${NEW_SECRET:-0}"
 EMAIL="${EMAIL:-}"                    # for Let's Encrypt registration
 CERTBOT="${CERTBOT:-1}"               # 0 = certificate is managed elsewhere
@@ -335,7 +337,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/telemt
+# 3.5.8 keeps persistent *.lock sidecars alongside managed configuration and PID
+# ownership; ProtectSystem=strict makes /etc read-only for the service, so the
+# config directory has to be writable or those claims fail.
+ReadWritePaths=/var/lib/telemt /etc/telemt
 
 [Install]
 WantedBy=multi-user.target

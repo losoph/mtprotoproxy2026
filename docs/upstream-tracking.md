@@ -79,6 +79,40 @@ whose notes mention `web` or `security`, an endpoint that stopped answering, a
 certificate about to expire, egress that started flapping again — all in one
 weekly mail, plus the existing alerting for anything acute.
 
+## Release log: what was checked before pinning
+
+### 3.5.8 (2026-09-27) — pinned
+
+Read for this node, nothing required:
+
+- **`base_path`** makes WEB ingress path-scoped per vhost. Optional, root by
+  default, so tldw is unaffected. If it is ever used: the terminator must pass the
+  public `Host` and the **complete path** through unchanged (no stripping,
+  rewriting, case-folding or normalising), the printed links change to the
+  path-aware Desktop encoding, and links have to be re-issued from a startup —
+  hot reload does not reprint them. It would also be the way to run the proxy on
+  a path of an existing site instead of a dedicated hostname; that is a separate
+  decision, and the decoy contract has to be re-thought before taking it.
+- **`web.debug.sideband`** (bridge pages reporting pre-handshake lifecycle over an
+  authenticated same-origin POST) defaults to `false`. Left off.
+- **Hardening**: descriptor-anchored filesystem operations rejecting symlink and
+  hard-link substitution, privileged helpers resolved from a fixed allowlist of
+  root-owned binaries in `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin` instead of
+  `PATH`, a TLS replay-protection claim taken before authentication completes, and
+  conntrack state reconciled by one owner. No configuration of ours depends on
+  `PATH` lookups or on those code paths.
+- **Validation and restart scope**: `up_bps`/`down_bps` are now range-checked (we
+  set neither), and `server.max_connections`, `server.conntrack_control`,
+  `general.direct_relay_buffer_budget_max_bytes` became restart-deferred (we set
+  none of them).
+- **One change we did make**: 3.5.8 keeps persistent `*.lock` sidecars next to
+  managed configuration and PID ownership, and must not have them deleted while
+  running. Our unit runs `ProtectSystem=strict`, which leaves `/etc` read-only for
+  the service, so `/etc/telemt` was added to `ReadWritePaths`.
+- **Rollback stays clean**: 3.5.7 rejects `base_path` and `web.debug.sideband`
+  under strict validation; we set neither, so pinning 3.5.7 again is a one-line
+  revert.
+
 ## When a release does warrant moving quickly
 
 Skip the weekly rhythm and bump the same day when the notes mention:

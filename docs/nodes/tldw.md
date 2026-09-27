@@ -7,7 +7,7 @@ serves a web application, which is exactly why the WEB proxy type fits here.
 | --- | --- |
 | Provider | Selectel (Russian network — see [`../upstream-path.md`](../upstream-path.md)) |
 | OS | Ubuntu 24.04, kernel 6.8.0-139, 4 cores, 50 GB disk |
-| Proxy | telemt 3.5.7, WEB transport only (`KEEP_MTPROTO=0`) |
+| Proxy | telemt 3.5.8, WEB transport only (`KEEP_MTPROTO=0`) |
 | Proxy hostname | `cdn.orangerd.ru` |
 | Site hostname | `tldw.orangerd.ru` (whisper-app, behind its own basic auth) |
 | Deploy | `deploy.sh` timer on `main`, checkout in `/root/mtprotoproxy2026` |
