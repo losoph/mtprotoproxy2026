@@ -68,6 +68,12 @@ deliberate, and the September 2026 history is the argument:
   restarted telemt each time. Automation that installs new binaries on the same
   schedule earns the same failure mode with worse consequences.
 
+The version is pinned in `setup-telemt-web-node.sh` and nowhere else. It is not
+recorded in a node's `deploy.env`, and `deploy.sh` unsets any stale value it finds
+there — otherwise a node keeps the version it was first installed with and the
+commit that bumps it changes nothing, which is exactly what happened on the first
+attempt to move tldw to 3.5.8.
+
 So the loop is: the weekly report (or `ghsub`) names a new tag → read the release
 notes → bump `TELEMT_VERSION` in a commit → the deploy applies it within five
 minutes → verify (`decoy=200`, `site` unchanged, a real client reaching

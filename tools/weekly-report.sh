@@ -9,8 +9,9 @@
 #
 # Usage:
 #   telemt-weekly-report.sh --to you@example.com [--dry-run]
-#   telemt-weekly-report.sh --to you@example.com --install        # Mon 09:00
-#   telemt-weekly-report.sh --to you@example.com --install --at 'Fri 18:00'
+#   telemt-weekly-report.sh --install                     # systemd timer, Sun 08:00
+#   telemt-weekly-report.sh --install --cron              # root crontab line instead
+#   telemt-weekly-report.sh --install --cron --at '0 9 * * 1'
 #
 # Upstream releases are reported, never installed: see docs/upstream-tracking.md
 # for why a proxy with users on it does not self-upgrade.
@@ -30,6 +31,7 @@ WATCH_REPOS="${WATCH_REPOS:-telemt/telemt telegramdesktop/tproxy-server scratch-
 GHSUB_STATE="${GHSUB_STATE:-}"        # optional: a file/dir ghsub keeps releases in
 AT="Sun 08:00"   # after ghsub's own digest, so both land in one reading
 INSTALL=0
+CRON=0
 DRY_RUN=0
 
 while [ $# -gt 0 ]; do
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
     --to) REPORT_TO="${2:-}"; shift 2 ;;
     --at) AT="${2:-}"; shift 2 ;;
     --install) INSTALL=1; shift ;;
+    --cron) CRON=1; shift ;;   # install a root crontab line instead of a timer
     --dry-run) DRY_RUN=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -61,6 +64,16 @@ MAIL_TAG="${TAG:-${HOSTNAME_TAG:-$(hostname -s)}}"
 
 if [ "$INSTALL" = 1 ]; then
   [ "$(id -u)" = 0 ] || { echo "run as root to install" >&2; exit 1; }
+  # A box whose other periodic jobs all live in root's crontab is better served by
+  # one more line there than by a second place to look for schedules.
+  if [ "$CRON" = 1 ]; then
+    EXPR="$AT"
+    case "$AT" in *[A-Za-z]*) EXPR='0 8 * * 0' ;; esac   # --at given in systemd syntax
+    LINE="$EXPR ${REPORT_TO:+REPORT_TO=$REPORT_TO }$SELF >/dev/null 2>&1"
+    { crontab -l 2>/dev/null | grep -vF "$(basename "$SELF")"; echo "$LINE"; } | crontab -
+    crontab -l | grep -F "$(basename "$SELF")"
+    exit 0
+  fi
   [ -n "$REPORT_TO" ] || [ "$OPS" = 1 ] || { echo "--install needs --to (no ops library to take ALERT_TO from)" >&2; exit 1; }
   cat > /etc/systemd/system/telemt-weekly-report.service <<EOF
 [Unit]

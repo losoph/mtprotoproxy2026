@@ -87,7 +87,10 @@ apply(){
   # Replay the recorded setup invocation. NEW_SECRET is never inherited: a
   # deploy must not rotate secrets and invalidate everyone's links.
   set -a; . "$ENV_FILE"; set +a
-  unset NEW_SECRET
+  # NEW_SECRET: a deploy must never rotate secrets. TELEMT_VERSION: the pin lives
+  # in the repo, and an older node's recorded value would otherwise override the
+  # commit being deployed — which is how a bump to 3.5.8 quietly stayed on 3.5.7.
+  unset NEW_SECRET TELEMT_VERSION
   git -C "$REPO_DIR" reset --hard --quiet "$target"
   log "applying $(git -C "$REPO_DIR" log -1 --format='%h %s' "$target")"
   bash "$REPO_DIR/setup-telemt-web-node.sh"

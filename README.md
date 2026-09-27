@@ -112,10 +112,14 @@ the latest upstream releases (with the keywords their notes mention), deploy and
 timer health, and a short "worth doing" list.
 
 ```bash
-telemt-weekly-report.sh --dry-run                    # --to only if the node has no ops library
-sudo telemt-weekly-report.sh --install               # Sun 08:00
-sudo telemt-weekly-report.sh --install --at 'Fri 18:00'
+telemt-weekly-report.sh --dry-run          # --to only if the node has no ops library
+sudo telemt-weekly-report.sh --install --cron          # root crontab, Sun 08:00
+sudo telemt-weekly-report.sh --install                 # or a systemd timer instead
 ```
+
+`--cron` exists because a node whose other periodic jobs (health checks, backups,
+resource reports, the ghsub digest) all live in root's crontab is better served by
+one more line there than by a second place to look for schedules.
 
 Both reports use the node's ops library when it has one
 (`/usr/local/lib/tldw/common.sh`: `send_mail`, `single_instance`, `ALERT_TO` and

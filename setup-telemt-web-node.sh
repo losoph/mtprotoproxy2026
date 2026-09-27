@@ -624,7 +624,9 @@ PORT=$PORT
 USERNAME=$USERNAME
 CLIENT_MSS=$CLIENT_MSS
 CLIENT_MSS_BULK=$CLIENT_MSS_BULK
-TELEMT_VERSION=$TELEMT_VERSION
+# TELEMT_VERSION is deliberately NOT recorded: it is pinned in this repo, so a
+# bump is a commit with an audit trail, not a per-node value that silently
+# outlives it. A manual run can still override it for one invocation.
 UPSTREAM_PROBE=$UPSTREAM_PROBE
 EMAIL=$EMAIL
 CERTBOT=$CERTBOT
