@@ -26,10 +26,11 @@ DC_IPS="${DC_IPS:-149.154.167.51 149.154.175.50 91.105.192.100}"
 CONTROL_IPS="${CONTROL_IPS:-1.1.1.1 140.82.121.4}"
 SCHEDULE=""
 DRY_RUN=0
+TO_EXPLICIT=0   # only an address given with --to may be baked into a unit or cron line
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --to) REPORT_TO="${2:-}"; shift 2 ;;
+    --to) REPORT_TO="${2:-}"; TO_EXPLICIT=1; shift 2 ;;
     --schedule) SCHEDULE="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;

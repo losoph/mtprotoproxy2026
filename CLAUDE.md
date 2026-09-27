@@ -8,6 +8,12 @@ for what each script does, and the docs below before touching a running node.
   what runs on it, which ports belong to whom, and every decision already taken.
 - [`docs/upstream-path.md`](docs/upstream-path.md) — the node's egress to the
   Telegram DCs, the measurements taken so far, and the middle-proxy playbook.
+- [`docs/upstream-tracking.md`](docs/upstream-tracking.md) — which MTProxy/WEB
+  upstreams still matter, the release log, and why versions are reported rather
+  than auto-installed.
+- [`docs/next-session.md`](docs/next-session.md) — **start here**: what is proven,
+  what is not, the decisions waiting, and the order to debug in when the proxy is
+  reported broken.
 
 ## Rules that cost us something to learn
 

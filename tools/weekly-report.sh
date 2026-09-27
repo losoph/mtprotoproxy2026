@@ -33,6 +33,7 @@ AT="Sun 08:00"   # after ghsub's own digest, so both land in one reading
 INSTALL=0
 CRON=0
 DRY_RUN=0
+TO_EXPLICIT=0   # only an address given with --to may be baked into a unit or cron line
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -71,7 +72,11 @@ if [ "$INSTALL" = 1 ]; then
     case "$AT" in *[A-Za-z]*) EXPR='0 8 * * 0' ;; esac   # --at given in systemd syntax
     ENV_PREFIX=""; [ "$TO_EXPLICIT" = 1 ] && ENV_PREFIX="REPORT_TO=$REPORT_TO "
     LINE="$EXPR $ENV_PREFIX$SELF >/dev/null 2>&1"
-    { crontab -l 2>/dev/null | grep -vF "$(basename "$SELF")"; echo "$LINE"; } | crontab -
+    # Read the whole crontab first, then write: `crontab -l | ... | crontab -` in
+    # one pipeline lets the writer truncate before the reader is done, and this
+    # box keeps a dozen jobs in there.
+    KEEP="$(crontab -l 2>/dev/null | grep -vF "$(basename "$SELF")" || true)"
+    { [ -n "$KEEP" ] && printf '%s\n' "$KEEP"; printf '%s\n' "$LINE"; } | crontab -
     crontab -l | grep -F "$(basename "$SELF")"
     exit 0
   fi
