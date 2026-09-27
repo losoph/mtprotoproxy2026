@@ -121,6 +121,26 @@ and a Russian location — the two switched-away sessions show as
 **Not yet tested:** the whole point — a Russian mobile carrier (MegaFon/MTS)
 without a VPN, session held for ten minutes.
 
+## Mail and alerting go through the node's ops library
+
+This box has one source of truth for mail: `/etc/tldw/health.env`
+(`ALERT_TO`, `ALERT_FROM`, `HOSTNAME_TAG`, `STATE_DIR`) consumed through
+`/usr/local/lib/tldw/common.sh`, which provides `send_mail` and
+`single_instance`. It is shared with the server's monitoring and with `ghsub`
+(the starred-repo release digest, `losoph/ghsub`, Sunday 07:00 MSK), whose README
+records why: an address copied into each script drifted apart once already.
+
+So `tools/probe-report.sh` and `tools/weekly-report.sh` source that library when
+it exists — recipient from `ALERT_TO`, subject tagged with `HOSTNAME_TAG`, lock via
+`single_instance` — and only fall back to their own `--to` + msmtp on a node that
+has no such library. Do not add a recipient to this repo or to a unit file here
+when the library can answer it.
+
+Release *notifications* are ghsub's job (star the repos in
+[`../upstream-tracking.md`](../upstream-tracking.md)); the weekly report only says
+whether the node drifted from the pinned version, and whether ghsub itself still
+ran.
+
 ## Secret hygiene on this node
 
 The WEB link has been pasted in plain text into a chat transcript, and telemt

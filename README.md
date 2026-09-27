@@ -112,10 +112,16 @@ the latest upstream releases (with the keywords their notes mention), deploy and
 timer health, and a short "worth doing" list.
 
 ```bash
-telemt-weekly-report.sh --to you@example.com --dry-run
-sudo telemt-weekly-report.sh --to you@example.com --install          # Mon 09:00
-sudo telemt-weekly-report.sh --to you@example.com --install --at 'Fri 18:00'
+telemt-weekly-report.sh --dry-run                    # --to only if the node has no ops library
+sudo telemt-weekly-report.sh --install               # Sun 08:00
+sudo telemt-weekly-report.sh --install --at 'Fri 18:00'
 ```
+
+Both reports use the node's ops library when it has one
+(`/usr/local/lib/tldw/common.sh`: `send_mail`, `single_instance`, `ALERT_TO` and
+`HOSTNAME_TAG` from `/etc/tldw/health.env`) and fall back to their own `--to` plus
+msmtp when it does not. A recipient belongs in that shared env file, never in this
+repo or in a unit written by it.
 
 ### Deploys, not hand edits
 

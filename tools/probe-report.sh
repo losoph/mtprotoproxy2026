@@ -37,18 +37,33 @@ while [ $# -gt 0 ]; do
 done
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# ---- the node's ops library, when it has one ---------------------------------
+# This box keeps one source of truth for mail: /etc/tldw/health.env via
+# /usr/local/lib/tldw/common.sh (ALERT_TO/ALERT_FROM/HOSTNAME_TAG, send_mail,
+# single_instance). Its own README records what happens otherwise — an address
+# copied into every script, drifting apart. So use the library when present and
+# fall back to plain msmtp only on a node that has none.
+LIB_DIR="${TLDW_LIB_DIR:-/usr/local/lib/tldw}"
+OPS=0
+if [ -f "$LIB_DIR/common.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$LIB_DIR/common.sh" && OPS=1
+fi
+REPORT_TO="${REPORT_TO:-${ALERT_TO:-}}"
+MAIL_TAG="${TAG:-${HOSTNAME_TAG:-$(hostname -s)}}"
+
 
 # ---- --schedule: one-shot timer ---------------------------------------------
 if [ -n "$SCHEDULE" ]; then
   [ "$(id -u)" = 0 ] || { echo "run as root to schedule" >&2; exit 1; }
-  [ -n "$REPORT_TO" ] || { echo "--schedule needs --to" >&2; exit 1; }
+  [ -n "$REPORT_TO" ] || [ "$OPS" = 1 ] || { echo "--schedule needs --to (no ops library to take ALERT_TO from)" >&2; exit 1; }
   cat > /etc/systemd/system/telemt-probe-report.service <<EOF
 [Unit]
 Description=Mail the Telegram-path probe report
 
 [Service]
 Type=oneshot
-Environment=REPORT_TO=$REPORT_TO
+${REPORT_TO:+Environment=REPORT_TO=$REPORT_TO}
 ExecStart=$SELF
 EOF
   cat > /etc/systemd/system/telemt-probe-report.timer <<EOF
@@ -71,7 +86,7 @@ EOF
   exit 0
 fi
 
-[ -n "$REPORT_TO" ] || { echo "REPORT_TO is unset (use --to you@example.com)" >&2; exit 1; }
+[ -n "$REPORT_TO" ] || [ "$OPS" = 1 ] || { echo "REPORT_TO is unset and no ops library found (use --to you@example.com)" >&2; exit 1; }
 
 # ---- collect ------------------------------------------------------------------
 count(){ grep -Eic -- "$1" 2>/dev/null || true; }
@@ -148,7 +163,7 @@ outside the filtered network is the durable fix."
 fi
 
 # ---- compose ------------------------------------------------------------------
-SUBJECT="[telemt] Telegram path: $BAD_N bad cycles / ~$EXPECTED_CYCLES on $(hostname -s)"
+SUBJECT="[$MAIL_TAG] telemt path: $BAD_N bad cycles / ~$EXPECTED_CYCLES"
 FROM="$(awk '$1=="from"{print $2; exit}' /etc/msmtprc 2>/dev/null || true)"
 
 BODY="$(cat <<EOF
@@ -206,6 +221,11 @@ MAIL="$( { [ -n "$FROM" ] && echo "From: $FROM"; \
 
 if [ "$DRY_RUN" = 1 ]; then
   printf '%s\n' "$MAIL"
+  exit 0
+fi
+if [ "$OPS" = 1 ]; then
+  send_mail "$SUBJECT" "$BODY"
+  echo "sent via ops send_mail: $SUBJECT"
   exit 0
 fi
 command -v msmtp >/dev/null || { echo "msmtp not found" >&2; exit 1; }

@@ -28,7 +28,7 @@ REPO_DIR="${REPO_DIR:-/root/mtprotoproxy2026}"
 # protocol's other implementations, watched for changes that affect WEB.
 WATCH_REPOS="${WATCH_REPOS:-telemt/telemt telegramdesktop/tproxy-server scratch-net/telego 9seconds/mtg}"
 GHSUB_STATE="${GHSUB_STATE:-}"        # optional: a file/dir ghsub keeps releases in
-AT="Mon 09:00"
+AT="Sun 08:00"   # after ghsub's own digest, so both land in one reading
 INSTALL=0
 DRY_RUN=0
 
@@ -43,17 +43,32 @@ while [ $# -gt 0 ]; do
 done
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# ---- the node's ops library, when it has one ---------------------------------
+# This box keeps one source of truth for mail: /etc/tldw/health.env via
+# /usr/local/lib/tldw/common.sh (ALERT_TO/ALERT_FROM/HOSTNAME_TAG, send_mail,
+# single_instance). Its own README records what happens otherwise — an address
+# copied into every script, drifting apart. So use the library when present and
+# fall back to plain msmtp only on a node that has none.
+LIB_DIR="${TLDW_LIB_DIR:-/usr/local/lib/tldw}"
+OPS=0
+if [ -f "$LIB_DIR/common.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$LIB_DIR/common.sh" && OPS=1
+fi
+REPORT_TO="${REPORT_TO:-${ALERT_TO:-}}"
+MAIL_TAG="${TAG:-${HOSTNAME_TAG:-$(hostname -s)}}"
+
 
 if [ "$INSTALL" = 1 ]; then
   [ "$(id -u)" = 0 ] || { echo "run as root to install" >&2; exit 1; }
-  [ -n "$REPORT_TO" ] || { echo "--install needs --to" >&2; exit 1; }
+  [ -n "$REPORT_TO" ] || [ "$OPS" = 1 ] || { echo "--install needs --to (no ops library to take ALERT_TO from)" >&2; exit 1; }
   cat > /etc/systemd/system/telemt-weekly-report.service <<EOF
 [Unit]
 Description=Mail the weekly telemt node report
 
 [Service]
 Type=oneshot
-Environment=REPORT_TO=$REPORT_TO
+${REPORT_TO:+Environment=REPORT_TO=$REPORT_TO}
 ExecStart=$SELF
 EOF
   cat > /etc/systemd/system/telemt-weekly-report.timer <<EOF
@@ -75,7 +90,8 @@ EOF
   exit 0
 fi
 
-[ -n "$REPORT_TO" ] || { echo "REPORT_TO is unset (use --to you@example.com)" >&2; exit 1; }
+[ -n "$REPORT_TO" ] || [ "$OPS" = 1 ] || { echo "REPORT_TO is unset and no ops library found (use --to you@example.com)" >&2; exit 1; }
+[ "$OPS" = 1 ] && [ "$DRY_RUN" = 0 ] && single_instance telemt-weekly-report
 
 count(){ grep -Eic -- "$1" 2>/dev/null || true; }
 TOKEN="$(cat "$API_TOKEN_FILE" 2>/dev/null || true)"
@@ -145,9 +161,12 @@ for r in $WATCH_REPOS; do
   line="$(latest_release "$r")"
   RELEASES="$RELEASES  $(printf '%-34s %s' "$r" "${line:-(unavailable)}")\n"
 done
+# ghsub on this node watches starred repos and mails releases; if it stopped
+# running, a release would go unnoticed no matter what this report says.
+GHSUB_DIR="${GHSUB_STATE:-${STATE_DIR:-/var/lib/tldw}/ghsub}"
 GHSUB=""
-if [ -n "$GHSUB_STATE" ] && [ -e "$GHSUB_STATE" ]; then
-  GHSUB="  ghsub state: $(ls -ld "$GHSUB_STATE" | awk '{print $6, $7, $8}')\n"
+if [ -d "$GHSUB_DIR" ]; then
+  GHSUB="  ghsub last run:          $(cat "$GHSUB_DIR/last_run.txt" 2>/dev/null || echo 'never')\n"
 fi
 
 # ---- 5. hygiene -------------------------------------------------------------
@@ -167,7 +186,7 @@ ACTION=""
 [ "$REBOOT" = yes ] && ACTION="$ACTION  * reboot required; remember the tunnel routes are laid by the up-script\n"
 [ -z "$ACTION" ] && ACTION="  * nothing demanding attention in this window.\n"
 
-SUBJECT="[telemt] weekly: $WEB_HOST, ${BAD_CYCLES} bad cycles, cert ${CERT_DAYS}d, pinned $PINNED"
+SUBJECT="[$MAIL_TAG] telemt weekly: $WEB_HOST, ${BAD_CYCLES} bad cycles, cert ${CERT_DAYS}d, pinned $PINNED"
 FROM="$(awk '$1=="from"{print $2; exit}' /etc/msmtprc 2>/dev/null || true)"
 BODY="$(cat <<EOF
 Node:    $(hostname -s) ($(hostname -I | awk '{print $1}'))
@@ -217,6 +236,11 @@ MAIL="$( { [ -n "$FROM" ] && echo "From: $FROM"; echo "To: $REPORT_TO"; echo "Su
            printf '%s\n' "$BODY"; } )"
 
 if [ "$DRY_RUN" = 1 ]; then printf '%s\n' "$MAIL"; exit 0; fi
+if [ "$OPS" = 1 ]; then
+  send_mail "$SUBJECT" "$BODY"
+  echo "sent via ops send_mail: $SUBJECT"
+  exit 0
+fi
 command -v msmtp >/dev/null || { echo "msmtp not found" >&2; exit 1; }
 printf '%s\n' "$MAIL" | msmtp -- "$REPORT_TO"
 echo "sent to $REPORT_TO: $SUBJECT"
