@@ -388,6 +388,8 @@ if [ "$UPSTREAM_PROBE" = 1 ] && [ -f "$SELF_DIR/tools/upstream-probe.sh" ]; then
   # the repo checkout (which may move, and is unreadable under ProtectHome).
   [ -f "$SELF_DIR/tools/probe-report.sh" ] &&
     install -m 755 "$SELF_DIR/tools/probe-report.sh" /usr/local/bin/telemt-probe-report.sh
+  [ -f "$SELF_DIR/tools/weekly-report.sh" ] &&
+    install -m 755 "$SELF_DIR/tools/weekly-report.sh" /usr/local/bin/telemt-weekly-report.sh
   cat > /etc/systemd/system/telemt-upstream-probe.service <<EOF
 [Unit]
 Description=Probe the node's path to the Telegram DCs (records episodic loss)
@@ -418,7 +420,7 @@ MIDDLE_PROXY_NAT_IP=$MIDDLE_PROXY_NAT_IP
 AD_TAG=$AD_TAG)"
   systemctl disable --now telemt-upstream-probe.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/telemt-upstream-probe.service "$PROBE_BIN" \
-        /usr/local/bin/telemt-probe-report.sh
+        /usr/local/bin/telemt-probe-report.sh /usr/local/bin/telemt-weekly-report.sh
   systemctl daemon-reload
 fi
 
@@ -652,6 +654,8 @@ Notes:
     are logged: journalctl -u telemt-upstream-probe --since today
   * Mail a report of it (msmtp): telemt-probe-report.sh --to you@example.com
     (--dry-run prints it; --schedule '2026-09-17 21:00' arms a one-shot timer)
+  * Weekly digest — availability, usage, egress stability, version drift:
+    telemt-weekly-report.sh --to you@example.com [--dry-run | --install]
   * Configuration follows git: commit a change, push, and the node applies it
     (bash deploy.sh --install once, then journalctl -u telemt-deploy -f).
     Editing /etc/nginx or /etc/telemt by hand is overwritten by the next deploy.

@@ -105,6 +105,18 @@ sudo telemt-probe-report.sh --to you@example.com \
 The scheduled timer uses the system timezone, survives a reboot (`Persistent`),
 fires late rather than never, and retires itself once it has run.
 
+For the standing rhythm there is [`tools/weekly-report.sh`](tools/weekly-report.sh):
+one mail a week with availability through the public endpoint, certificate days
+left, how much WEB was actually used, egress stability, the pinned version against
+the latest upstream releases (with the keywords their notes mention), deploy and
+timer health, and a short "worth doing" list.
+
+```bash
+telemt-weekly-report.sh --to you@example.com --dry-run
+sudo telemt-weekly-report.sh --to you@example.com --install          # Mon 09:00
+sudo telemt-weekly-report.sh --to you@example.com --install --at 'Fri 18:00'
+```
+
 ### Deploys, not hand edits
 
 `setup-telemt-web-node.sh` records its invocation in `/etc/telemt/deploy.env`,
@@ -207,6 +219,9 @@ at the end. Re-runnable; pass `SSH_HARDEN=1` to also disable password login,
 - [`docs/upstream-path.md`](docs/upstream-path.md) — the node's egress to the
   Telegram DCs: measurements, the `USE_MIDDLE_PROXY=1` playbook (and the NAT
   address trap), and when to move the node instead.
+- [`docs/upstream-tracking.md`](docs/upstream-tracking.md) — which MTProxy/WEB
+  upstreams still matter (WEB is a carrier, the inner protocol is still MTProxy),
+  and why new releases are reported rather than installed automatically.
 - [`CLAUDE.md`](CLAUDE.md) — conventions for changing any of this.
 
 ## The 2026 TSPU reality (read this)
