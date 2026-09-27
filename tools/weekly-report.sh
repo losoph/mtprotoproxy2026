@@ -23,7 +23,7 @@ WINDOW_DAYS="${WINDOW_DAYS:-7}"
 REPORT_TO="${REPORT_TO:-}"
 API="${API:-http://127.0.0.1:9091}"
 API_TOKEN_FILE="${API_TOKEN_FILE:-/var/lib/telemt/api-token}"
-ENV_FILE="${ENV_FILE:-/etc/telemt/deploy.env}"
+DEPLOY_ENV="${DEPLOY_ENV:-/etc/telemt/deploy.env}"   # not ENV_FILE: common.sh owns that name
 REPO_DIR="${REPO_DIR:-/root/mtprotoproxy2026}"
 # Repos worth knowing about. The first one is what runs here; the rest are the
 # protocol's other implementations, watched for changes that affect WEB.
@@ -36,7 +36,7 @@ DRY_RUN=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --to) REPORT_TO="${2:-}"; shift 2 ;;
+    --to) REPORT_TO="${2:-}"; TO_EXPLICIT=1; shift 2 ;;
     --at) AT="${2:-}"; shift 2 ;;
     --install) INSTALL=1; shift ;;
     --cron) CRON=1; shift ;;   # install a root crontab line instead of a timer
@@ -69,7 +69,8 @@ if [ "$INSTALL" = 1 ]; then
   if [ "$CRON" = 1 ]; then
     EXPR="$AT"
     case "$AT" in *[A-Za-z]*) EXPR='0 8 * * 0' ;; esac   # --at given in systemd syntax
-    LINE="$EXPR ${REPORT_TO:+REPORT_TO=$REPORT_TO }$SELF >/dev/null 2>&1"
+    ENV_PREFIX=""; [ "$TO_EXPLICIT" = 1 ] && ENV_PREFIX="REPORT_TO=$REPORT_TO "
+    LINE="$EXPR $ENV_PREFIX$SELF >/dev/null 2>&1"
     { crontab -l 2>/dev/null | grep -vF "$(basename "$SELF")"; echo "$LINE"; } | crontab -
     crontab -l | grep -F "$(basename "$SELF")"
     exit 0
@@ -112,9 +113,12 @@ api(){ curl -sS --max-time 8 -H "Authorization: Bearer $TOKEN" "$API$1" 2>/dev/n
 
 # ---- 1. availability, through the public endpoint ----------------------------
 # shellcheck disable=SC1090
-[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+[ -f "$DEPLOY_ENV" ] && { set -a; . "$DEPLOY_ENV"; set +a; }
 WEB_HOST="${WEB_HOST:-}"; SITE_HOST="${SITE_HOST:-}"
-http_code(){ curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
+http_code(){   # curl prints the code itself — a `|| echo` here doubles it
+  local c; c="$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "$1" 2>/dev/null)"
+  printf '%s' "${c:-000}"
+}
 AVAIL=""
 [ -n "$WEB_HOST" ] && AVAIL="$AVAIL  https://$WEB_HOST/            $(http_code "https://$WEB_HOST/")   (expect 200, the decoy)\n"
 [ -n "$WEB_HOST" ] && AVAIL="$AVAIL  https://$WEB_HOST/nope        $(http_code "https://$WEB_HOST/nope")   (expect a site-like 404)\n"
@@ -127,21 +131,38 @@ fi
 
 # ---- 2. was it used, and did WEB behave -------------------------------------
 WEB_STATUS="$(api /v1/runtime/web/status)"
-USAGE="$(printf '%s' "$WEB_STATUS" | python3 -c '
-import sys, json
-try: d = json.load(sys.stdin)["data"]
-except Exception: print("  (control API unavailable)"); raise SystemExit
+# The program comes from the heredoc, the JSON from the environment: with
+# `python3 - <<PY` the heredoc *is* stdin, so a piped payload never arrives —
+# and both that and escaped quotes inside an f-string fail silently, leaving
+# "control API unavailable" while the API answers fine.
+USAGE="$(WEB_STATUS="$WEB_STATUS" python3 - <<'PY'
+import os, json
+try:
+    d = json.loads(os.environ.get("WEB_STATUS") or "")["data"]
+except Exception:
+    raise SystemExit
+ing = d.get("ingress") or {}
+print("  lifecycle:               %s  accepting=%s" % (d.get("lifecycle"), ing.get("accepting_connections")))
+print("  tcp accepts:             %s" % ing.get("tcp_accept_total"))
 r = d.get("runtime") or {}
 t = r.get("totals") or r
-print(f"  lifecycle:               {d.get(\"lifecycle\")}  accepting={(d.get(\"ingress\") or {}).get(\"accepting_connections\")}")
-print(f"  tcp accepts:             {(d.get(\"ingress\") or {}).get(\"tcp_accept_total\")}")
-for k in ("sessions_created","sessions_closed","sessions_live","streams_opened","streams_rejected","bytes_up","bytes_down"):
-    if k in t: print(f"  {k+\":\":24} {t[k]}")
-' 2>/dev/null)"
+for k in ("sessions_created", "sessions_closed", "sessions_live",
+          "streams_opened", "streams_rejected", "bytes_up", "bytes_down"):
+    if k in t:
+        print("  %-24s %s" % (k + ":", t[k]))
+PY
+)"
 [ -n "$USAGE" ] || USAGE="  (control API unavailable)"
-SESSIONS_NOW="$(api /v1/runtime/web/sessions | python3 -c 'import sys,json
-try: print(len(json.load(sys.stdin)["data"]["sessions"]))
-except Exception: print("?")' 2>/dev/null | head -1)"
+
+SESSIONS_JSON="$(api /v1/runtime/web/sessions)"
+SESSIONS_NOW="$(SESSIONS_JSON="$SESSIONS_JSON" python3 - <<'PY'
+import os, json
+try:
+    print(len(json.loads(os.environ.get("SESSIONS_JSON") or "")["data"]["sessions"]))
+except Exception:
+    print("?")
+PY
+)"
 [ -n "$SESSIONS_NOW" ] || SESSIONS_NOW="?"
 
 # ---- 3. egress stability (the thing that broke in September) ----------------
@@ -156,7 +177,9 @@ EGRESS_DEV="$(ip route get 149.154.167.51 2>/dev/null | sed -n '1s/.* dev \([^ ]
 
 # ---- 4. version drift -------------------------------------------------------
 INSTALLED="$(/usr/local/bin/telemt --version 2>/dev/null | head -1)"
-PINNED="${TELEMT_VERSION:-?}"
+PINNED="$(sed -n 's/^TELEMT_VERSION="\${TELEMT_VERSION:-\([^}]*\)}"/\1/p' \
+  "$REPO_DIR/setup-telemt-web-node.sh" 2>/dev/null | head -1)"
+[ -n "$PINNED" ] || PINNED="?"
 latest_release(){   # repo -> "tag\tdate\tkeywords found in the notes"
   curl -sS --max-time 15 "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | python3 -c '
 import sys, json, re
@@ -207,7 +230,8 @@ Window:  last $WINDOW_DAYS days
 Report:  $(date '+%F %T %Z')
 
 == Availability (through the public endpoint) ==
-$(printf '%b' "${AVAIL:-  (no hostnames in $ENV_FILE)}")  certificate:             $CERT_DAYS days left
+$(printf '%b' "${AVAIL:-  (no hostnames in $DEPLOY_ENV)}")
+  certificate:             $CERT_DAYS days left
 
 == WEB usage ==
 $USAGE
@@ -222,7 +246,7 @@ $USAGE
 
 == Versions (reported, never auto-installed) ==
   installed:               ${INSTALLED:-unknown}
-  pinned in deploy.env:    $PINNED
+  pinned in the repo:      $PINNED
   latest upstream releases (repo, tag, date, keywords in the notes):
 $(printf '%b' "$RELEASES")$(printf '%b' "$GHSUB")
   A tag ahead of the pinned one is a decision, not an incident: read the notes,
